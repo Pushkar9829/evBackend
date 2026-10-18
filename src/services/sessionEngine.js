@@ -469,6 +469,10 @@ export async function onTransactionEvent(charger, p) {
   if (meter.wh !== undefined) {
     const r = applyReading(s, meter.wh, readingAt, { maxPowerKw: conn?.maxPowerKw || 350, older });
     if (r === 'rejected') logger.warn(`meter reading rejected for session ${s._id}: ${meter.wh} Wh`);
+    if (['ok', 'start', 'reset', 'same'].includes(r)) {
+      s.meterPoints.push({ t: serverNow, wh: energyOf(s), w: meter.powerW, soc: meter.soc });
+      if (s.meterPoints.length > 600) s.meterPoints = s.meterPoints.filter((_, i) => i % 2 === 0); // keep the shape, halve the points
+    }
   }
   s.energyWh = energyOf(s);
   // V2G (OCPP 2.1): energy returned to the grid, monotonic like the import register
@@ -662,7 +666,8 @@ export async function finalizeSession(sessionId, { flag } = {}) {
   }
   if (s.fleet && bill.totalPaise > 0) await chargeFleet(s, bill.totalPaise);
   if (s.postpaid && s.channel === 'app' && bill.totalPaise > 0) await chargeAutopay(s, bill.totalPaise);
-  if (bill.totalPaise > 0) await issueSessionInvoice(s._id).catch((e) => logger.error('invoice', e));
+  // Fleet sessions are billed on the fleet's monthly invoice instead of one invoice per session.
+  if (bill.totalPaise > 0 && !s.fleet) await issueSessionInvoice(s._id).catch((e) => logger.error('invoice', e));
   const after = await Session.findById(s._id);
   notify('session_completed', {
     user: s.driver, phone: s.guestPhone, session: s._id, eventAt: s.chargerTime?.endedAt || s.endedAt,

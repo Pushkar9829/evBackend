@@ -47,7 +47,8 @@ export async function seed({ reset = false, quiet = false } = {}) {
       name: 'VoltGrid Energy', slug: 'voltgrid', type: 'company', status: 'active', legalName: 'VoltGrid Energy Pvt Ltd', gstin: '27AABCV1234F1Z5', address: 'Baner, Pune, Maharashtra',
       kyc: { status: 'verified', pan: 'AABCV1234F', gstin: '27AABCV1234F1Z5' }, ocpiPartyId: 'VGE', invoicePrefix: 'VGE', payoutDelayDays: 2,
       contact: { name: 'Vikram', email: 'owner@voltgrid.in', phone: '9000000002' }, alertContacts: { emails: ['ops@voltgrid.in'] },
-      bank: { accountName: 'VoltGrid Energy Pvt Ltd', accountNumberLast4: '4321', ifsc: 'HDFC0001234' }, featureFlags: { roaming: true },
+      bank: { accountName: 'VoltGrid Energy Pvt Ltd', accountNumberLast4: '4321', ifsc: 'HDFC0001234' }, featureFlags: { roaming: true, white_label: true },
+      branding: { appName: 'VoltGo', primaryColor: '#2563eb', accentColor: '#f59e0b' },
     });
   }
   let gp = await Tenant.findOne({ slug: 'greenplug' });

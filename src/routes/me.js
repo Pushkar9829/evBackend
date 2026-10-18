@@ -307,6 +307,19 @@ router.patch('/fleet/drivers/:userId', async (req, res) => {
   res.json({ fleet });
 });
 
+router.get('/fleet/invoices', async (req, res) => {
+  const fleet = await myManagedFleet(req);
+  res.json({ invoices: await Invoice.find({ fleet: fleet._id, kind: 'fleet_monthly' }).sort({ issuedAt: -1 }).select('number period supplier totalPaise gstPaise issuedAt lines').lean() });
+});
+
+router.get('/fleet/invoices/:id/pdf', async (req, res) => {
+  const fleet = await myManagedFleet(req);
+  const inv = await Invoice.findOne({ _id: req.params.id, fleet: fleet._id });
+  if (!inv) throw notFound();
+  const { invoicePdf } = await import('../services/invoices.js');
+  invoicePdf(inv, res);
+});
+
 router.post('/fleet/vehicles', async (req, res) => {
   const fleet = await myManagedFleet(req);
   const b = parse(z.object({ registration: z.string().min(4).max(20), vehicleType: z.enum(['2W', '3W', 'car', 'bus']), label: z.string().max(40).optional() }), req.body);

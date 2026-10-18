@@ -18,9 +18,13 @@ export async function tariffForConnector(charger, connector, at = new Date()) {
   return t;
 }
 
-export function snapshot(tariff, tenant) {
+export function snapshot(tariff, tenant, { at = new Date() } = {}) {
   const o = tariff.toObject ? tariff.toObject() : { ...tariff };
+  // "Price shown before start = price charged": the time-of-day rate in force at start is locked for the session.
+  const now = currentPrice(o, at);
   return {
+    lockedEnergyPaisePerKwh: now.energyPaisePerKwh,
+    lockedBand: now.band,
     _id: o._id,
     key: o.key,
     name: o.name,
@@ -45,9 +49,36 @@ const istHour = (d) => new Date(new Date(d).getTime() + 5.5 * 3600_000).getUTCHo
 
 export function energyRateAt(t, at = new Date(), { roaming = false } = {}) {
   if (roaming && t.roamingEnergyPaisePerKwh) return t.roamingEnergyPaisePerKwh;
+  if (t.lockedEnergyPaisePerKwh) return t.lockedEnergyPaisePerKwh; // session snapshot: price locked at start
   const h = istHour(at);
   const band = (t.tod || []).find((b) => (b.startHour <= b.endHour ? h >= b.startHour && h < b.endHour : h >= b.startHour || h < b.endHour));
   return band ? band.energyPaisePerKwh : t.energyPaisePerKwh;
+}
+
+/**
+ * The energy price in force now, its time-of-day band, and when it next changes (driver price display).
+ */
+export function currentPrice(t, at = new Date()) {
+  const bands = t.tod || [];
+  const h = istHour(at);
+  const inBand = (b, hour) => (b.startHour <= b.endHour ? hour >= b.startHour && hour < b.endHour : hour >= b.startHour || hour < b.endHour);
+  const band = bands.find((b) => inBand(b, h));
+  const rate = band ? band.energyPaisePerKwh : t.energyPaisePerKwh;
+  let next = null;
+  if (bands.length) {
+    for (let i = 1; i <= 24; i += 1) {
+      const hh = (h + i) % 24;
+      const b = bands.find((x) => inBand(x, hh));
+      const r = b ? b.energyPaisePerKwh : t.energyPaisePerKwh;
+      if (r !== rate || (b?.label || null) !== (band?.label || null)) {
+        const atIst = new Date(new Date(at).getTime() + 5.5 * 3600_000);
+        atIst.setUTCMinutes(0, 0, 0);
+        next = { at: new Date(atIst.getTime() + i * 3600_000 - 5.5 * 3600_000), energyPaisePerKwh: r, band: b?.label || 'Standard' };
+        break;
+      }
+    }
+  }
+  return { energyPaisePerKwh: rate, band: band ? band.label || `${band.startHour}:00–${band.endHour}:00` : bands.length ? 'Standard' : null, next };
 }
 
 const lineGst = (taxable, rate, inclusive) => (inclusive ? splitInclusive(taxable, rate) : { taxable, gst: gstOn(taxable, rate) });
@@ -69,7 +100,7 @@ export function computeBill(session, { at = new Date(), capPaise } = {}) {
   }
 
   const energyPaise = roundPaise(session.costs?.energyExact || (energyWh * t.energyPaisePerKwh) / 1000);
-  lines.push({ code: 'energy', description: `Energy ${(energyWh / 1000).toFixed(3)} kWh`, quantity: energyWh / 1000, unit: 'kWh', ratePaise: t.energyPaisePerKwh, amount: energyPaise });
+  lines.push({ code: 'energy', description: `Energy ${(energyWh / 1000).toFixed(3)} kWh${t.lockedBand && t.lockedBand !== 'Standard' ? ` (${t.lockedBand})` : ''}`, quantity: energyWh / 1000, unit: 'kWh', ratePaise: t.lockedEnergyPaisePerKwh || t.energyPaisePerKwh, amount: energyPaise });
 
   if (t.sessionFeePaise) lines.push({ code: 'session_fee', description: 'Session fee', quantity: 1, unit: 'session', ratePaise: t.sessionFeePaise, amount: t.sessionFeePaise });
 
@@ -168,7 +199,8 @@ export function previewTariff(t, samples = [5, 10, 20, 30]) {
 }
 
 /** Estimated kWh and minutes for each amount (UX 1.3 smart amount suggestions). */
-export function estimateForAmount(t, amountPaise, maxPowerKw = 7.4, inclusive = false) {
+export function estimateForAmount(t0, amountPaise, maxPowerKw = 7.4, inclusive = false) {
+  const t = { ...(t0?.toObject ? t0.toObject() : t0), energyPaisePerKwh: currentPrice(t0?.toObject ? t0.toObject() : t0).energyPaisePerKwh };
   const rate = config.gstRateBps;
   const net = inclusive ? amountPaise : Math.floor((amountPaise * 10000) / (10000 + rate));
   const forEnergy = Math.max(0, net - (t.sessionFeePaise || 0));

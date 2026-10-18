@@ -261,6 +261,14 @@ registerExecutor('adjustment', async (a) => {
   return { applied: true };
 });
 
+router.post('/billing/monthly', can('payout.run'), async (req, res) => {
+  const b = parse(z.object({ month: z.string().regex(/^\d{4}-\d{2}$/).optional() }), req.body || {});
+  const { runMonthlyBilling } = await import('../services/monthlyBilling.js');
+  const r = await runMonthlyBilling(b.month);
+  await audit(req, { action: 'billing.monthly', entity: 'Invoice', after: r });
+  res.json(r);
+});
+
 router.post('/reconciliation/run', can('reconciliation.view'), async (req, res) => {
   const b = parse(z.object({ date: z.coerce.date().optional() }), req.body || {});
   const run = await reconcile(b.date || new Date());

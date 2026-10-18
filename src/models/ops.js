@@ -62,6 +62,8 @@ const AlertSchema = new Schema(
     count: { type: Number, default: 1 },
     lastAt: { type: Date, default: Date.now },
     resolvedBy: { type: Types.ObjectId, ref: 'User' },
+    deliveredTo: [String],
+    deliveredAt: Date,
   },
   { timestamps: true },
 );

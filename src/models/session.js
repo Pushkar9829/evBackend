@@ -75,7 +75,8 @@ const SessionSchema = new Schema(
       lastEnergyAt: Date, // last time energy increased
     },
     energyWh: { type: Number, default: 0 },
-    exportedWh: { type: Number, default: 0 }, // V2G: energy returned to the grid (OCPP 2.1)
+    exportedWh: { type: Number, default: 0 },
+    meterPoints: { type: [{ t: Date, wh: Number, w: Number, soc: Number, _id: false }], default: [] }, // for the CMS power/energy graph // V2G: energy returned to the grid (OCPP 2.1)
     exportMeter: { startWh: Number, lastWh: Number },
     chargingNeeds: Schema.Types.Mixed, // ISO 15118 NotifyEVChargingNeeds
     live: { powerW: Number, socPct: Number, updatedAt: Date, zeroPowerSince: Date, chargingState: String },
@@ -106,6 +107,7 @@ const SessionSchema = new Schema(
     tenantSharePaise: Number,
     siteHostSharePaise: Number,
     invoice: { type: Types.ObjectId, ref: 'Invoice' },
+    fleetInvoice: { type: Types.ObjectId, ref: 'Invoice' }, // fleet sessions are invoiced monthly
     failureReason: String,
     stopReason: String,
     flags: { type: [String], default: [] }, // late_start, meter_rejected, offline_final, review, overrun, reversal...
@@ -184,7 +186,8 @@ const InvoiceLineSchema = new Schema(
 const InvoiceSchema = new Schema(
   {
     tenant: { type: Types.ObjectId, ref: 'Tenant', index: true },
-    kind: { type: String, enum: ['driver', 'commission', 'credit_note', 'fleet_monthly'], default: 'driver' },
+    kind: { type: String, enum: ['driver', 'commission', 'credit_note', 'fleet_monthly', 'saas_fee'], default: 'driver' },
+    period: String, // YYYY-MM for monthly invoices
     session: { type: Types.ObjectId, ref: 'Session', index: true },
     payout: { type: Types.ObjectId, ref: 'Payout' },
     fleet: { type: Types.ObjectId, ref: 'Fleet' },

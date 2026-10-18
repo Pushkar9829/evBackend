@@ -12,6 +12,7 @@ import { markOffline } from '../ocpp/brain.js';
 import { sendCommand } from '../ocpp/commands.js';
 import { pushPendingCdrs } from '../roaming/ocpi/client.js';
 import { cluster } from '../ocpp/cluster.js';
+import { runMonthlyBilling, previousMonth } from './monthlyBilling.js';
 
 const timers = [];
 const running = new Set();
@@ -102,6 +103,9 @@ async function daily() {
   lastDaily = d;
   const yesterday = new Date(Date.now() - 86400_000);
   await reconcile(yesterday);
+  // 1st of the month (IST): fleet invoices + SaaS plan fees for last month, before the payout run
+  const istDay = new Date(Date.now() + 5.5 * 3600_000).getUTCDate();
+  if (istDay === 1 || istDay === 2) await runMonthlyBilling(previousMonth());
   await runPayouts();
 }
 

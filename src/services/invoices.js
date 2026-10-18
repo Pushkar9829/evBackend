@@ -19,7 +19,7 @@ async function allocateNumber(prefix, scopeKey, date = new Date()) {
 /** Create the driver invoice for a billed session. Safe to call repeatedly (retry job). */
 export async function issueSessionInvoice(sessionId) {
   const session = await Session.findById(sessionId);
-  if (!session || session.state !== 'BILLED' || !(session.costs?.totalPaise > 0)) return null;
+  if (!session || session.state !== 'BILLED' || !(session.costs?.totalPaise > 0) || session.fleet) return null;
   let inv = session.invoice ? await Invoice.findById(session.invoice) : await Invoice.findOne({ session: session._id, kind: 'driver', status: { $ne: 'cancelled' } });
   if (inv?.status === 'issued') return inv;
   const tenant = await Tenant.findById(session.tenant).lean();
@@ -63,7 +63,7 @@ export async function issueSessionInvoice(sessionId) {
 export async function retryFailedInvoices() {
   const pending = await Invoice.find({ kind: 'driver', status: { $in: ['failed', 'pending'] }, attempts: { $lt: 10 } }).limit(50).select('session');
   for (const i of pending) await issueSessionInvoice(i.session);
-  const missing = await Session.find({ state: 'BILLED', invoice: null, 'costs.totalPaise': { $gt: 0 } }).limit(50).select('_id');
+  const missing = await Session.find({ state: 'BILLED', invoice: null, fleet: null, 'costs.totalPaise': { $gt: 0 } }).limit(50).select('_id');
   for (const s of missing) await issueSessionInvoice(s._id);
   return pending.length + missing.length;
 }

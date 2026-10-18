@@ -47,7 +47,7 @@ describe('2.2 discovery and charger status', () => {
     await waitFor(async () => (await sessionDoc(s.sessionId)).state === 'CHARGING', { label: 'charging' });
     const d = await sessionDoc(s.sessionId);
     assert.equal(d.tariff.version, shown.tariffVersion);
-    assert.equal(d.tariff.energyPaisePerKwh, shown.energyPaisePerKwh);
+    assert.equal(d.tariff.lockedEnergyPaisePerKwh, shown.energyPaisePerKwh, 'rate shown = rate locked for the session');
     await api.post(`/api/sessions/${s.sessionId}/stop`).set('x-session-token', s.accessToken);
   });
 });
@@ -116,6 +116,17 @@ describe('Phase 2', () => {
     assert.equal(after5.lines.find((l) => l.code === 'idle').amount, 1000);
     const capped = computeBill({ ...base, endedAt: new Date(base.chargingEndedAt.getTime() + 120 * 60_000) });
     assert.equal(capped.lines.find((l) => l.code === 'idle').amount, 2000);
+  });
+
+  it('Time-of-day: current price + next change shown; the rate at start is locked for the whole session', async () => {
+    const { currentPrice, snapshot, energyRateAt: rateAt } = await import('../src/services/tariffs.js');
+    const t = { energyPaisePerKwh: 2200, tod: [{ startHour: 18, endHour: 22, energyPaisePerKwh: 2500, label: 'Evening peak' }] };
+    const p = currentPrice(t, new Date('2026-10-18T11:00:00Z')); // 16:30 IST
+    assert.equal(p.energyPaisePerKwh, 2200);
+    assert.equal(p.next.energyPaisePerKwh, 2500);
+    assert.equal(new Date(p.next.at).toISOString(), '2026-10-18T12:30:00.000Z'); // 18:00 IST
+    const snap = snapshot(t, {}, { at: new Date('2026-10-18T11:00:00Z') });
+    assert.equal(rateAt(snap, new Date('2026-10-18T13:30:00Z')), 2200, 'peak band later in the session does not change the locked price');
   });
 
   it('Time-of-day pricing uses IST bands', () => {

@@ -3,15 +3,18 @@ import { Charger, Content, PartnerLocation, Site, Tenant } from '../models/index
 import { config } from '../config.js';
 import { AppError } from '../lib/errors.js';
 import { escapeRegex } from '../lib/util.js';
-import { getSettings } from '../services/settings.js';
-import { activeTariff, estimateForAmount } from '../services/tariffs.js';
+import { flagOn, getSettings } from '../services/settings.js';
+import { activeTariff, currentPrice, estimateForAmount } from '../services/tariffs.js';
 import { isOnline } from '../ocpp/commands.js';
 import { optionalAuth } from '../middleware/auth.js';
 import { parse, phoneSchema, z } from '../lib/validate.js';
 import { requestOtp, verifyOtp } from '../services/otp.js';
 import { exportData, openRequest } from '../services/privacy.js';
 import { planRoute } from '../services/routePlanner.js';
-import { DataRequest } from '../models/index.js';
+import { Complaint, DataRequest } from '../models/index.js';
+import rateLimit from 'express-rate-limit';
+import { isTest } from '../config.js';
+import { raiseAlert } from '../services/alerts.js';
 
 const router = express.Router();
 export const PRESET_AMOUNTS = [10000, 20000, 50000];
@@ -35,7 +38,7 @@ export function displayStatus(charger, c) {
 
 export async function publicCharger(ch, { site, tenant, origin } = {}) {
   const s = site || (await Site.findById(ch.site).lean());
-  const t = tenant || (await Tenant.findById(ch.tenant).select('name slug pricesIncludeGst branding').lean());
+  const t = tenant || (await Tenant.findById(ch.tenant).select('name slug pricesIncludeGst branding featureFlags').lean());
   const tariff = await activeTariff(ch.tenant, ch.tariffKey);
   const connectors = ch.connectors.map((c) => ({
     number: c.number,
@@ -58,7 +61,10 @@ export async function publicCharger(ch, { site, tenant, origin } = {}) {
     working: usable,
     price: tariff && {
       tariffVersion: tariff.version,
-      energyPaisePerKwh: tariff.energyPaisePerKwh,
+      ...(() => {
+        const now = currentPrice(tariff);
+        return { energyPaisePerKwh: now.energyPaisePerKwh, band: now.band, nextChange: now.next, standardPaisePerKwh: tariff.energyPaisePerKwh };
+      })(),
       sessionFeePaise: tariff.sessionFeePaise,
       timePaisePerMin: tariff.timePaisePerMin,
       idle: tariff.idle,
@@ -71,6 +77,8 @@ export async function publicCharger(ch, { site, tenant, origin } = {}) {
     rating: ch.rating,
     photos: ch.photos,
     roaming: ch.roamingEnabled,
+    // QR pages of white-label operators are shown in the operator's brand
+    branding: t?.branding?.primaryColor && (await flagOn('white_label', t)) ? { slug: t.slug, name: t.branding.appName || t.name, logoUrl: t.branding.logoUrl, primaryColor: t.branding.primaryColor, accentColor: t.branding.accentColor } : undefined,
   };
 }
 
@@ -112,7 +120,7 @@ router.get('/chargers', optionalAuth, async (req, res) => {
     sites = sites.filter((s) => rx.test(s.name) || rx.test(s.city || '') || rx.test(s.address || ''));
   }
   const siteMap = new Map(sites.map((s) => [String(s._id), s]));
-  const tenants = new Map((await Tenant.find({ _id: { $in: tenantIds } }).select('name slug pricesIncludeGst').lean()).map((t) => [String(t._id), t]));
+  const tenants = new Map((await Tenant.find({ _id: { $in: tenantIds } }).select('name slug pricesIncludeGst branding featureFlags').lean()).map((t) => [String(t._id), t]));
   const origin = lat && lng ? { lat: Number(lat), lng: Number(lng) } : null;
   let out = [];
   for (const ch of chargers) {
@@ -131,6 +139,23 @@ router.get('/chargers', optionalAuth, async (req, res) => {
   // DIS-06: nothing nearby -> return the nearest one with a widen-search hint
   if (origin && !inRadius.length && out.length) return res.json({ chargers: [out[0]], nearestOnly: true });
   return res.json({ chargers: inRadius, nearestOnly: false });
+});
+
+const reportLimit = rateLimit({ windowMs: 15 * 60_000, limit: isTest ? 1000 : 5, standardHeaders: true, legacyHeaders: false, message: { error: { code: 'RATE_LIMITED', message: 'Too many reports. Please try again later.' } } });
+
+/** "Spot blocked" / "charger damaged" without a session (DIS-03): complaint + ops alert. */
+router.post('/chargers/:ocppId/report', reportLimit, optionalAuth, async (req, res) => {
+  const b = parse(z.object({ category: z.enum(['spot_blocked', 'charger_damaged', 'other']), connector: z.number().int().positive().optional(), description: z.string().max(500).optional(), phone: phoneSchema.optional() }), req.body);
+  const ch = await Charger.findOne({ ocppId: req.params.ocppId, deletedAt: null }).lean();
+  if (!ch) throw new AppError(404, 'NOT_FOUND', 'Charger not found.');
+  const tenant = await Tenant.findById(ch.tenant).select('complaintSlaHours').lean();
+  const c = await Complaint.create({
+    tenant: ch.tenant, charger: ch._id, driver: req.auth?.kind === 'driver' ? req.user._id : undefined, phone: b.phone, category: b.category,
+    description: `${b.connector ? `Connector ${b.connector}: ` : ''}${b.description || ''}`.trim() || undefined, autoDetected: false,
+    slaDueAt: new Date(Date.now() + (tenant?.complaintSlaHours || 24) * 3600_000),
+  });
+  await raiseAlert({ tenant: ch.tenant, type: b.category === 'spot_blocked' ? 'spot_blocked' : 'charger_reported', severity: 'warning', charger: ch._id, message: `${ch.ocppId}${b.connector ? `#${b.connector}` : ''} reported by a driver: ${b.category.replace(/_/g, ' ')}`, dedupeKey: `report:${ch.ocppId}:${b.category}` });
+  res.status(201).json({ id: c._id });
 });
 
 router.get('/chargers/:ocppId', async (req, res) => {
@@ -182,7 +207,9 @@ router.get('/content', async (req, res) => {
 });
 
 router.get('/branding/:slug', async (req, res) => {
-  const t = await Tenant.findOne({ slug: req.params.slug }).select('name slug branding').lean();
+  const t = await Tenant.findOne({ slug: req.params.slug, status: 'active' }).select('name slug branding featureFlags').lean();
+  // White-label is a paid add-on: only tenants with the flag get their own branding.
+  if (t && !(await flagOn('white_label', t))) throw new AppError(404, 'NO_WHITE_LABEL', 'White-label is not enabled for this operator.');
   if (!t) throw new AppError(404, 'NOT_FOUND', 'Not found.');
   res.json({ slug: t.slug, name: t.branding?.appName || t.name, logoUrl: t.branding?.logoUrl, primaryColor: t.branding?.primaryColor, accentColor: t.branding?.accentColor });
 });

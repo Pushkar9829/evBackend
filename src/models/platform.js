@@ -115,6 +115,7 @@ const AdjustmentSchema = new Schema(
     status: { type: String, enum: ['pending_approval', 'applied', 'rejected', 'settled'], default: 'pending_approval' },
     approval: { type: Types.ObjectId, ref: 'Approval' },
     payout: { type: Types.ObjectId, ref: 'Payout' },
+    ref: { type: String, index: { unique: true, sparse: true } }, // idempotency for system adjustments
     createdBy: { type: Types.ObjectId, ref: 'User' },
   },
   { timestamps: true },

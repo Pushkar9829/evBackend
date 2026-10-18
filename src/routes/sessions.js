@@ -58,26 +58,41 @@ export async function sessionView(s, access) {
   if (['PAID'].includes(s.state)) step = 1;
   if (s.state === 'STARTING') step = s.pluggedAt ? 2 : 1;
   if (['CHARGING', 'STOPPING', 'INTERRUPTED', 'COMPLETED', 'BILLED'].includes(s.state)) step = 3;
+  // English text for API clients + a key/vars pair the driver app translates (Hindi, more later).
   let message = null;
+  let messageKey = null;
   const amt = `Rs ${((s.prepaidPaise || s.capPaise || 0) / 100).toFixed(0)}`;
+  const messageVars = { amount: amt, reason: pay?.failureReason || '', kwh: ((s.energyWh || 0) / 1000).toFixed(1) };
+  const say = (key, text) => {
+    messageKey = key;
+    message = text;
+  };
   if (s.state === 'CREATED') {
-    if (pay?.status === 'failed') message = `Payment failed${pay.failureReason ? `: ${pay.failureReason}` : ''}. Nothing was charged. Please try again or use another method.`;
-    else if (pay?.status === 'cancelled') message = 'Payment cancelled, nothing charged.';
-    else message = 'Waiting for your bank to confirm the payment. Charging starts as soon as it is confirmed. If it is not confirmed in 5 minutes, nothing will be charged.';
-  } else if (s.state === 'STARTING') message = s.pluggedAt ? 'Talking to charger... waiting for your car.' : 'Plug the cable into your vehicle.';
-  else if (s.state === 'INTERRUPTED') message = `We lost contact with the charger, but charging continues. Your bill will update when it reconnects. You will never pay more than ${amt}.`;
-  else if (s.state === 'CHARGING' && s.live?.chargingState === 'SuspendedEV' && !(s.energyWh > 0)) message = 'Your car is not accepting charge.';
-  else if (s.state === 'CHARGING' && s.live?.updatedAt && Date.now() - new Date(s.live.updatedAt).getTime() > 10 * 60_000) message = 'Waiting for update from the charger.';
-  else if (s.state === 'FAILED') message = `${FAILURE_MESSAGES[s.failureReason] || "Charging didn't start."} ${s.prepaidPaise ? `Your ${amt} is being refunded now (usually instant, up to 5 days for some banks).` : ''}`.trim();
-  else if (s.state === 'CANCELLED') message = s.failureReason === 'payment_timeout' ? 'The payment was not confirmed in 5 minutes, so nothing was charged. If money left your account it will be refunded automatically.' : 'Cancelled. Nothing was charged.';
-  else if (s.state === 'BILLED' && s.stopReason === 'limit') message = `Your ${amt} has been used: ${(s.energyWh / 1000).toFixed(1)} kWh added. Please unplug your vehicle.`;
-  else if (s.state === 'BILLED') message = 'Charging complete. Please unplug and free the spot.';
+    if (pay?.status === 'failed') say('payment_failed', `Payment failed${pay.failureReason ? `: ${pay.failureReason}` : ''}. Nothing was charged. Please try again or use another method.`);
+    else if (pay?.status === 'cancelled') say('payment_cancelled', 'Payment cancelled, nothing charged.');
+    else say('payment_pending', 'Waiting for your bank to confirm the payment. Charging starts as soon as it is confirmed. If it is not confirmed in 5 minutes, nothing will be charged.');
+  } else if (s.state === 'STARTING') {
+    if (s.pluggedAt) say('talking', 'Talking to charger... waiting for your car.');
+    else say('plug_in', 'Plug the cable into your vehicle.');
+  } else if (s.state === 'INTERRUPTED') say('interrupted', `We lost contact with the charger, but charging continues. Your bill will update when it reconnects. You will never pay more than ${amt}.`);
+  else if (s.state === 'CHARGING' && s.live?.chargingState === 'SuspendedEV' && !(s.energyWh > 0)) say('ev_not_accepting', 'Your car is not accepting charge.');
+  else if (s.state === 'CHARGING' && s.live?.updatedAt && Date.now() - new Date(s.live.updatedAt).getTime() > 10 * 60_000) say('waiting_update', 'Waiting for update from the charger.');
+  else if (s.state === 'FAILED') {
+    say(`failed_${s.failureReason || 'unknown'}`, `${FAILURE_MESSAGES[s.failureReason] || "Charging didn't start."} ${s.prepaidPaise ? `Your ${amt} is being refunded now (usually instant, up to 5 days for some banks).` : ''}`.trim());
+    messageVars.refunding = s.prepaidPaise ? 'yes' : '';
+  } else if (s.state === 'CANCELLED') {
+    if (s.failureReason === 'payment_timeout') say('cancelled_timeout', 'The payment was not confirmed in 5 minutes, so nothing was charged. If money left your account it will be refunded automatically.');
+    else say('cancelled', 'Cancelled. Nothing was charged.');
+  } else if (s.state === 'BILLED' && s.stopReason === 'limit') say('limit_used', `Your ${amt} has been used: ${messageVars.kwh} kWh added. Please unplug your vehicle.`);
+  else if (s.state === 'BILLED') say('complete', 'Charging complete. Please unplug and free the spot.');
   const inv = s.invoice ? await Invoice.findById(s.invoice).select('number status totalPaise').lean() : null;
   return {
     id: s._id,
     state: s.state,
     access,
     message,
+    messageKey,
+    messageVars,
     steps: STEPS,
     step,
     channel: s.channel,
@@ -87,7 +102,7 @@ export async function sessionView(s, access) {
     prepaidPaise: s.prepaidPaise,
     capPaise: s.capPaise,
     postpaid: s.postpaid,
-    tariff: s.tariff && { energyPaisePerKwh: s.tariff.energyPaisePerKwh, sessionFeePaise: s.tariff.sessionFeePaise, timePaisePerMin: s.tariff.timePaisePerMin, version: s.tariff.version, idle: s.tariff.idle },
+    tariff: s.tariff && { energyPaisePerKwh: s.tariff.lockedEnergyPaisePerKwh || s.tariff.energyPaisePerKwh, band: s.tariff.lockedBand, sessionFeePaise: s.tariff.sessionFeePaise, timePaisePerMin: s.tariff.timePaisePerMin, version: s.tariff.version, idle: s.tariff.idle },
     energyWh: s.energyWh,
     live: s.live,
     liveCostPaise: live?.totalPaise,

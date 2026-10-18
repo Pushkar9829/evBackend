@@ -129,8 +129,10 @@ router.get('/me', requireAuth, async (req, res) => {
   if (req.auth.kind === 'staff') {
     await ensureRoles(req.user.memberships.map((m) => m.role));
     const contexts = staffContexts(req.user);
-    const tenants = await Tenant.find({ _id: { $in: contexts.filter((c) => c.tenant).map((c) => c.tenant) } }).select('name type slug').lean();
-    return res.json({ kind: 'staff', user: u, ctx: req.ctx, permissions: roleDef(req.ctx.role)?.perms || [], contexts: contexts.map((c) => ({ ...c, tenantName: tenants.find((t) => String(t._id) === c.tenant)?.name })) });
+    const tenants = await Tenant.find({ _id: { $in: contexts.filter((c) => c.tenant).map((c) => c.tenant) } }).select('name type slug branding featureFlags').lean();
+    const cur = tenants.find((t) => String(t._id) === String(req.ctx.tenant));
+    const wl = cur && (cur.featureFlags instanceof Map ? cur.featureFlags.get('white_label') : cur.featureFlags?.white_label);
+    return res.json({ kind: 'staff', branding: wl && cur.branding?.primaryColor ? { name: cur.branding.appName || cur.name, logoUrl: cur.branding.logoUrl, primaryColor: cur.branding.primaryColor, accentColor: cur.branding.accentColor } : null, user: u, ctx: req.ctx, permissions: roleDef(req.ctx.role)?.perms || [], contexts: contexts.map((c) => ({ ...c, tenantName: tenants.find((t) => String(t._id) === c.tenant)?.name })) });
   }
   return res.json({ kind: 'driver', user: u });
 });

@@ -24,6 +24,17 @@ const today = () => {
 
 // ------------------------------------------------------------- dashboard
 
+/** Site host: usage and revenue share of their own site(s) (Requirements 2, read-only). */
+router.get('/site-host/summary', can('site.revenue_share'), async (req, res) => {
+  const days = Math.min(Number(req.query.days || 30), 366);
+  const sites = await Site.find(scope(req, { siteField: '_id' })).select('name revenueShareBps').lean();
+  const rows = await Session.aggregate([
+    { $match: { site: { $in: sites.map((s) => s._id) }, state: 'BILLED', endedAt: { $gte: sinceDays(days) } } },
+    { $group: { _id: '$site', sessions: { $sum: 1 }, energyWh: { $sum: '$energyWh' }, taxablePaise: { $sum: '$costs.taxablePaise' }, sharePaise: { $sum: '$siteHostSharePaise' } } },
+  ]);
+  res.json({ days, sites: sites.map((s) => ({ ...s, ...(rows.find((r) => String(r._id) === String(s._id)) || { sessions: 0, energyWh: 0, taxablePaise: 0, sharePaise: 0 }) })) });
+});
+
 router.get('/dashboard', async (req, res) => {
   const f = scope(req);
   const chargerF = { ...f, deletedAt: null };
