@@ -1,4 +1,5 @@
 import PDFDocument from 'pdfkit';
+import { PassThrough } from 'node:stream';
 import { Invoice, Session, Tenant, User, nextSeq } from '../models/index.js';
 import { config } from '../config.js';
 import { financialYear } from '../lib/util.js';
@@ -119,10 +120,24 @@ export async function issueCommissionInvoice(payout) {
 const rs = (p) => `Rs ${(p / 100).toFixed(2)}`;
 
 /** Stream a simple GST invoice PDF. */
+/** Render the invoice PDF to a Buffer (email attachments). */
+export function invoicePdfBuffer(inv) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const sink = new PassThrough();
+    sink.on('data', (c) => chunks.push(c));
+    sink.on('end', () => resolve(Buffer.concat(chunks)));
+    sink.on('error', reject);
+    invoicePdf(inv, sink);
+  });
+}
+
 export function invoicePdf(inv, res) {
   const doc = new PDFDocument({ size: 'A4', margin: 48 });
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="${(inv.number || 'invoice').replace(/\//g, '-')}.pdf"`);
+  if (res.setHeader) {
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${(inv.number || 'invoice').replace(/\//g, '-')}.pdf"`);
+  }
   doc.pipe(res);
   const title = inv.kind === 'credit_note' ? 'CREDIT NOTE' : 'TAX INVOICE';
   doc.fontSize(18).text(title, { align: 'right' });

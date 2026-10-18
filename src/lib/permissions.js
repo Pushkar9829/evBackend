@@ -53,5 +53,38 @@ export const ROLES = {
 export const TENANT_ROLES = Object.entries(ROLES).filter(([, r]) => r.scope === 'tenant' || r.scope === 'site').map(([k]) => k);
 export const PLATFORM_ROLES = Object.entries(ROLES).filter(([, r]) => r.scope === 'platform').map(([k]) => k);
 
-export const roleHas = (role, perm) => !!ROLES[role]?.perms.includes(perm);
-export const roleNeeds2fa = (role) => !!ROLES[role]?.money || roleHas(role, 'charger.command');
+// Scopes a tenant can grant to an API key for its own systems (Phase 3).
+export const API_SCOPES = ['chargers:read', 'sessions:read', 'sessions:write', 'tariffs:read', 'finance:read'];
+
+// Permissions a tenant may give its own custom roles (Phase 3): everything a tenant owner can do.
+export const TENANT_ASSIGNABLE = ROLES.tenant_owner.perms;
+export const MONEY_PERMS = ['session.refund', 'finance.view', 'invoice.manage', 'bank.manage', 'payout.run', 'payout.hold', 'adjustment.create', 'commission.manage'];
+
+// Custom roles are stored in the database; services/roles.js keeps this cache warm.
+const customCache = new Map(); // id -> { def, at }
+export function cacheCustomRole(doc) {
+  const perms = (doc.perms || []).filter((p) => TENANT_ASSIGNABLE.includes(p));
+  customCache.set(String(doc._id), {
+    at: Date.now(),
+    def: { scope: doc.scope || 'tenant', perms, refundLimitPaise: doc.refundLimitPaise ?? 0, money: perms.some((p) => MONEY_PERMS.includes(p)), custom: true, name: doc.name, tenant: String(doc.tenant), archived: !!doc.archived },
+  });
+}
+export const dropCustomRole = (id) => customCache.delete(String(id));
+export const customCacheAge = (id) => {
+  const c = customCache.get(String(id));
+  return c ? Date.now() - c.at : Infinity;
+};
+
+/** Definition of a fixed role or of a "custom:<id>" role (null when unknown). */
+export function roleDef(role) {
+  if (!role) return null;
+  if (ROLES[role]) return ROLES[role];
+  if (String(role).startsWith('custom:')) {
+    const c = customCache.get(role.slice(7));
+    return c && !c.def.archived ? c.def : null;
+  }
+  return null;
+}
+
+export const roleHas = (role, perm) => !!roleDef(role)?.perms.includes(perm);
+export const roleNeeds2fa = (role) => !!roleDef(role)?.money || roleHas(role, 'charger.command');

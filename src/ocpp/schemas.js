@@ -31,6 +31,11 @@ const v201 = {
   NotifyReport: { requestId: 'integer', generatedAt: 'datetime', seqNo: 'integer' },
   DataTransfer: { vendorId: 'string' },
   ReservationStatusUpdate: { reservationId: 'integer', reservationUpdateStatus: 'string' },
+  // Security (A02/A03) and ISO 15118 Plug & Charge (C07, M01-M06)
+  SignCertificate: { csr: 'string', certificateType: '?string' },
+  Get15118EVCertificate: { iso15118SchemaVersion: 'string', action: 'string', exiRequest: 'string' },
+  GetCertificateStatus: { ocspRequestData: 'object' },
+  NotifyEVChargingNeeds: { evseId: 'integer', chargingNeeds: 'object' },
 };
 
 const v16 = {
@@ -44,9 +49,13 @@ const v16 = {
   DiagnosticsStatusNotification: { status: 'string' },
   FirmwareStatusNotification: { status: 'string' },
   DataTransfer: { vendorId: 'string' },
+  // OCPP 1.6 security whitepaper extension
+  SignCertificate: { csr: 'string' },
+  SecurityEventNotification: { type: 'string', timestamp: 'datetime' },
 };
 
-export const SCHEMAS = { 'ocpp2.0.1': v201, 'ocpp1.6': v16 };
+// OCPP 2.1 is backward compatible with 2.0.1; the same table applies.
+export const SCHEMAS = { 'ocpp2.0.1': v201, 'ocpp2.1': v201, 'ocpp1.6': v16 };
 
 const isDate = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
 

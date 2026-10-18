@@ -7,6 +7,11 @@ import { getSettings } from '../services/settings.js';
 import { activeTariff, estimateForAmount } from '../services/tariffs.js';
 import { isOnline } from '../ocpp/commands.js';
 import { optionalAuth } from '../middleware/auth.js';
+import { parse, phoneSchema, z } from '../lib/validate.js';
+import { requestOtp, verifyOtp } from '../services/otp.js';
+import { exportData, openRequest } from '../services/privacy.js';
+import { planRoute } from '../services/routePlanner.js';
+import { DataRequest } from '../models/index.js';
 
 const router = express.Router();
 export const PRESET_AMOUNTS = [10000, 20000, 50000];
@@ -186,6 +191,40 @@ router.get('/branding/:slug', async (req, res) => {
 router.get('/partner-locations', async (_req, res) => {
   const locs = await PartnerLocation.find().limit(500).populate('partner', 'name enabled').lean();
   res.json({ locations: locs.filter((l) => l.partner?.enabled).map((l) => ({ id: l._id, partner: l.partner.name, name: l.name, address: l.address, city: l.city, coordinates: l.coordinates, evses: (l.evses || []).map((e) => ({ uid: e.uid, status: e.status, connectors: e.connectors })) })) });
+});
+
+/** Route planner: charging stops along a trip (Phase 2). */
+router.post('/route-plan', async (req, res) => {
+  const pt = z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) });
+  const b = parse(z.object({
+    from: pt, to: pt,
+    rangeKm: z.number().min(20).max(1000),
+    socPct: z.number().min(1).max(100).default(80),
+    reservePct: z.number().min(0).max(50).default(15),
+    chargeToPct: z.number().min(30).max(100).default(80),
+    batteryKwh: z.number().min(1).max(250).default(40),
+    corridorKm: z.number().min(1).max(30).default(8),
+    connectorTypes: z.array(z.string()).optional(),
+    vehicleType: z.enum(['2W', '3W', 'car', 'bus']).optional(),
+  }), req.body);
+  res.json(await planRoute(b));
+});
+
+// Guests (no account) exercise data rights by proving the phone number with an OTP.
+router.post('/data-requests/otp', async (req, res) => {
+  const b = parse(z.object({ phone: phoneSchema }), req.body);
+  res.json(await requestOtp(b.phone, 'data_request'));
+});
+
+router.post('/data-requests', async (req, res) => {
+  const b = parse(z.object({ phone: phoneSchema, code: z.string(), kind: z.enum(['delete', 'export']), reason: z.string().max(500).optional() }), req.body);
+  await verifyOtp(b.phone, 'data_request', b.code);
+  if (b.kind === 'export') {
+    await DataRequest.create({ phone: b.phone, kind: 'export', source: 'guest_request', status: 'completed', completedAt: new Date(), history: [{ status: 'completed', at: new Date(), note: 'guest export after OTP' }] });
+    return res.json({ export: await exportData({ phone: b.phone }) });
+  }
+  const r = await openRequest({ phone: b.phone, kind: 'delete', source: 'guest_request', reason: b.reason });
+  return res.status(201).json({ request: { id: r._id, status: r.status, dueAt: r.dueAt } });
 });
 
 export default router;

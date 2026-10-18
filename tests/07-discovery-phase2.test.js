@@ -138,7 +138,7 @@ describe('Phase 2', () => {
     const d = await waitFor(async () => { const x = await sessionDoc(r.body.sessionId); return x.state === 'BILLED' && x; }, { label: 'billed' });
     assert.ok(d.costs.discountPaise > 0);
     assert.equal(d.costs.taxablePaise + d.costs.gstPaise, d.costs.totalPaise);
-    const p = await PromoCode.findOne({ code: 'FIRST20' });
+    const p = await waitFor(async () => { const x = await PromoCode.findOne({ code: 'FIRST20' }); return x.usedPaise > 0 && x; }, { label: 'promo use recorded' });
     assert.equal(p.usedPaise, d.costs.discountPaise);
     const again = await api.post('/api/sessions').send({ ocppId: 'VG-PUN-001', connector: 2, amountPaise: 20000, phone: '9700000099', promoCode: 'FIRST20' });
     assert.equal(again.status, 400);

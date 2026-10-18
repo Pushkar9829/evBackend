@@ -6,6 +6,8 @@ import { raiseAlert, resolveAlerts } from '../services/alerts.js';
 import { events } from '../services/events.js';
 import { authorizeToken, onConnectorStatus, onTransactionEvent } from '../services/sessionEngine.js';
 import { sendCommand } from './commands.js';
+import { IssuedCertificate, checkContractHash, fingerprint, signStationCsr } from '../services/pki.js';
+import { securityEvent } from '../services/audit.js';
 
 const reload = (conn) => Charger.findById(conn.charger._id);
 
@@ -45,8 +47,58 @@ export async function handleCall(conn, action, p) {
     }
     case 'Authorize': {
       const charger = await reload(conn);
-      const status = await authorizeToken(charger, p.idToken?.idToken);
+      // ISO 15118 Plug & Charge: the EV presents its contract certificate (hash data) and eMAID (C07)
+      if (p.idToken?.type === 'eMAID') {
+        const certificateStatus = await checkContractHash(p.idToken.idToken, p.iso15118CertificateHashData || []);
+        const status = certificateStatus === 'Accepted' ? await authorizeToken(charger, p.idToken.idToken, { type: 'eMAID' }) : 'Invalid';
+        if (certificateStatus !== 'Accepted') await securityEvent('pnc_certificate_rejected', { ocppId: conn.ocppId, emaid: p.idToken.idToken, certificateStatus, tenant: String(charger.tenant) });
+        return { idTokenInfo: { status }, certificateStatus };
+      }
+      const status = await authorizeToken(charger, p.idToken?.idToken, { type: p.idToken?.type });
       return { idTokenInfo: { status } };
+    }
+    case 'SignCertificate': {
+      // A02/A03: charger sends a CSR; we sign it with the CSMS CA and push CertificateSigned.
+      const charger = await reload(conn);
+      const kind = p.certificateType === 'V2GCertificate' ? 'V2GCertificate' : 'ChargingStationCertificate';
+      setTimeout(async () => {
+        try {
+          const signed = await signStationCsr(charger, p.csr, kind);
+          const r = await sendCommand(charger, 'CertificateSigned', { certificateChain: signed.chain, certificateType: kind }, { reason: 'certificate signing' });
+          if (r.status === 'Accepted' && kind === 'ChargingStationCertificate') {
+            await Charger.updateOne({ _id: charger._id }, { $set: { certificate: { serial: signed.hash.serialNumber, notAfter: signed.notAfter, fingerprint: fingerprint(signed.pem), issuedAt: new Date() } } });
+          }
+        } catch (e) {
+          await raiseAlert({ tenant: charger.tenant, type: 'security', charger: charger._id, message: `Certificate signing failed for ${charger.ocppId}: ${e.message}` });
+        }
+      }, 50);
+      return { status: 'Accepted' };
+    }
+    case 'Get15118EVCertificate': {
+      // M02: install/update a contract certificate in the EV. Requires a Contract Certificate Pool (EXI pass-through).
+      if (!process.env.CCP_URL) return { status: 'Failed', exiResponse: '', statusInfo: { reasonCode: 'NoCertificatePool', additionalInfo: 'Set CCP_URL to forward ISO 15118-2 EXI requests' } };
+      try {
+        const r = await fetch(process.env.CCP_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(process.env.CCP_TOKEN ? { Authorization: `Bearer ${process.env.CCP_TOKEN}` } : {}) }, body: JSON.stringify(p), signal: AbortSignal.timeout(20000) });
+        const j = await r.json();
+        return { status: j.exiResponse ? 'Accepted' : 'Failed', exiResponse: j.exiResponse || '' };
+      } catch (e) {
+        logger.warn(`CCP request failed: ${e.message}`);
+        return { status: 'Failed', exiResponse: '' };
+      }
+    }
+    case 'GetCertificateStatus': {
+      // M06: OCSP check for a certificate in the EV's chain. We answer for certificates we issued.
+      const serial = String(p.ocspRequestData?.serialNumber || '').replace(/^0+/, '');
+      const c = await IssuedCertificate.findOne({ serial }).lean();
+      if (!c) return { status: 'Failed', statusInfo: { reasonCode: 'UnknownCertificate' } };
+      return { status: c.revokedAt || c.notAfter < new Date() ? 'Failed' : 'Accepted', ocspResult: Buffer.from(JSON.stringify({ serial, good: !c.revokedAt, nextUpdate: new Date(Date.now() + 86400_000) })).toString('base64') };
+    }
+    case 'NotifyEVChargingNeeds': {
+      // ISO 15118 charging needs (departure time, energy request, V2X parameters) stored on the open session
+      const charger = await reload(conn);
+      const { Session } = await import('../models/index.js');
+      await Session.updateOne({ charger: charger._id, evseId: p.evseId, state: { $in: ['STARTING', 'CHARGING'] } }, { $set: { chargingNeeds: p.chargingNeeds } });
+      return { status: 'Accepted' };
     }
     case 'TransactionEvent': {
       const charger = await reload(conn);

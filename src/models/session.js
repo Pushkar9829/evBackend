@@ -22,6 +22,7 @@ const TariffSchema = new Schema(
     memberDiscountBps: { type: Number, default: 0 },
     fleetDiscountBps: { type: Number, default: 0 },
     roamingEnergyPaisePerKwh: Number,
+    v2gExportPaisePerKwh: { type: Number, default: 0 }, // credit per kWh returned to the grid [Confirm]
     activeFrom: { type: Date, default: Date.now },
     publishedAt: Date,
     publishReason: String,
@@ -42,7 +43,7 @@ const SessionSchema = new Schema(
     connectorId: Number,
     driver: { type: Types.ObjectId, ref: 'User', index: true },
     guestPhone: { type: String, index: true },
-    channel: { type: String, enum: ['qr', 'app', 'roaming', 'fleet', 'admin', 'rfid', 'uei'], default: 'qr' },
+    channel: { type: String, enum: ['qr', 'app', 'roaming', 'fleet', 'admin', 'rfid', 'uei', 'pnc'], default: 'qr' },
     accessTokenHash: String, // full-control token held by the browser that paid
     viewTokenHash: String, // read-only token used in SMS/WhatsApp links (QR-07)
     state: { type: String, enum: SESSION_STATES, default: 'CREATED', index: true },
@@ -74,6 +75,9 @@ const SessionSchema = new Schema(
       lastEnergyAt: Date, // last time energy increased
     },
     energyWh: { type: Number, default: 0 },
+    exportedWh: { type: Number, default: 0 }, // V2G: energy returned to the grid (OCPP 2.1)
+    exportMeter: { startWh: Number, lastWh: Number },
+    chargingNeeds: Schema.Types.Mixed, // ISO 15118 NotifyEVChargingNeeds
     live: { powerW: Number, socPct: Number, updatedAt: Date, zeroPowerSince: Date, chargingState: String },
     seqSeen: { type: [String], default: [] }, // processed TransactionEvent keys: seqNo or timestamp (CHG-07)
     maxSeq: { type: Number, default: -1 },

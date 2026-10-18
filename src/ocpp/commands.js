@@ -2,6 +2,7 @@
 import { Charger, CommandLog } from '../models/index.js';
 import { registry } from './registry.js';
 import { OcppError } from './connection.js';
+import { cluster } from './cluster.js';
 
 const STATUS_OK = new Set(['Accepted', 'Unlocked', 'Scheduled', 'AcceptedCanceled', 'RebootRequired']);
 
@@ -16,16 +17,17 @@ export async function sendCommand(chargerOrOcppId, action, payload = {}, { by, r
   const conn = registry.get(ocppId);
   let status;
   let response;
-  if (!conn || conn.closed) {
+  const viaCluster = (!conn || conn.closed) && cluster().enabled && registry.isConnected(ocppId);
+  if ((!conn || conn.closed) && !viaCluster) {
     status = 'Offline';
   } else {
     try {
-      response = await conn.call(action, payload, timeoutMs);
+      response = viaCluster ? await cluster().call(ocppId, action, payload, timeoutMs) : await conn.call(action, payload, timeoutMs);
       const s = response?.status || response?.getVariableResult?.[0]?.attributeStatus || response?.setVariableResult?.[0]?.attributeStatus;
       status = s === undefined ? 'Accepted' : STATUS_OK.has(s) ? 'Accepted' : 'Rejected';
       if (action === 'GetTransactionStatus') status = 'Accepted';
     } catch (e) {
-      status = e instanceof OcppError ? (e.code === 'Timeout' ? 'TimedOut' : e.code === 'Offline' ? 'Offline' : 'Error') : 'Error';
+      status = e.code === 'Timeout' ? 'TimedOut' : e.code === 'Offline' ? 'Offline' : 'Error';
       response = { error: e.message, code: e.code };
     }
   }
@@ -33,7 +35,4 @@ export async function sendCommand(chargerOrOcppId, action, payload = {}, { by, r
   return { status, response, commandId: entry?._id };
 }
 
-export const isOnline = (ocppId) => {
-  const c = registry.get(ocppId);
-  return !!c && !c.closed;
-};
+export const isOnline = (ocppId) => registry.isConnected(ocppId);

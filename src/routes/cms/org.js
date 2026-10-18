@@ -4,10 +4,11 @@ import bcrypt from 'bcryptjs';
 import { Adjustment, Alert, Approval, AuditLog, Cdr, Charger, Complaint, Payout, PromoCode, ReconciliationRun, Refund, RoamingPartner, Session, Settlement, Site, Tariff, Tenant, User } from '../../models/index.js';
 import { parse, phoneSchema, z } from '../../lib/validate.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/errors.js';
-import { TENANT_ROLES, ROLES } from '../../lib/permissions.js';
+import { TENANT_ROLES, roleDef } from '../../lib/permissions.js';
 import { can, loadScoped, scope, writeTenant } from '../../middleware/auth.js';
 import { audit } from '../../services/audit.js';
 import { decideApproval } from '../../services/approvals.js';
+import { assertAssignable, roleOptions } from './access.js';
 import { nextTariffVersion, previewTariff } from '../../services/tariffs.js';
 import { listSims, simAction, startSim, stopSim, getSim } from '../../services/simulators.js';
 import { mockControls } from '../../services/payments/mock.js';
@@ -200,12 +201,13 @@ router.get('/reports/sessions.csv', can('report.view'), async (req, res) => {
 router.get('/staff', can('staff.manage'), async (req, res) => {
   const tenant = writeTenant(req, req.query.tenant);
   const users = await User.find({ 'memberships.tenant': tenant }).select('name email phone memberships status lastLoginAt twoFactorEnabled').lean();
-  res.json({ roles: TENANT_ROLES.filter((r) => r !== 'individual_host'), staff: users.map((u) => ({ ...u, membership: u.memberships.find((m) => String(m.tenant) === String(tenant)), memberships: undefined })) });
+  res.json({ roles: TENANT_ROLES.filter((r) => r !== 'individual_host'), roleOptions: await roleOptions(tenant), staff: users.map((u) => ({ ...u, membership: u.memberships.find((m) => String(m.tenant) === String(tenant)), memberships: undefined })) });
 });
 
 router.post('/staff', can('staff.manage'), async (req, res) => {
-  const b = parse(z.object({ tenant: z.string().optional(), email: z.string().email(), name: z.string().min(2).max(80), phone: phoneSchema.optional(), role: z.enum(TENANT_ROLES), siteIds: z.array(z.string()).optional(), password: z.string().min(8).max(100) }), req.body);
+  const b = parse(z.object({ tenant: z.string().optional(), email: z.string().email(), name: z.string().min(2).max(80), phone: phoneSchema.optional(), role: z.string(), siteIds: z.array(z.string()).optional(), password: z.string().min(8).max(100) }), req.body);
   const tenant = writeTenant(req, b.tenant);
+  await assertAssignable(b.role, tenant);
   if (b.role === 'tenant_owner' && req.ctx.role !== 'tenant_owner' && !req.isPlatform) throw forbidden('Only an owner can add another owner.');
   let u = await User.findOne({ email: b.email.toLowerCase() });
   if (u?.membershipFor(tenant)) throw conflict('ALREADY_MEMBER', 'This person is already on your team.');
@@ -223,8 +225,9 @@ router.post('/staff', can('staff.manage'), async (req, res) => {
 });
 
 router.patch('/staff/:userId', can('staff.manage'), async (req, res) => {
-  const b = parse(z.object({ tenant: z.string().optional(), role: z.enum(TENANT_ROLES).optional(), siteIds: z.array(z.string()).optional(), twoFactorEnabled: z.boolean().optional() }), req.body);
+  const b = parse(z.object({ tenant: z.string().optional(), role: z.string().optional(), siteIds: z.array(z.string()).optional(), twoFactorEnabled: z.boolean().optional() }), req.body);
   const tenant = writeTenant(req, b.tenant);
+  if (b.role) await assertAssignable(b.role, tenant);
   const u = await User.findById(req.params.userId);
   const m = u?.membershipFor(tenant);
   if (!m) throw notFound('Not on this team.');
@@ -233,7 +236,7 @@ router.patch('/staff/:userId', can('staff.manage'), async (req, res) => {
   if (b.role) m.role = b.role;
   if (b.siteIds) m.siteIds = b.siteIds;
   if (b.twoFactorEnabled !== undefined) {
-    if (!b.twoFactorEnabled && ROLES[m.role]?.money) throw forbidden('Two-factor login is mandatory for money roles.');
+    if (!b.twoFactorEnabled && roleDef(m.role)?.money) throw forbidden('Two-factor login is mandatory for money roles.');
     u.twoFactorEnabled = b.twoFactorEnabled;
   }
   u.sessionVersion = (u.sessionVersion || 0) + 1; // role change applies immediately
@@ -281,7 +284,7 @@ router.get('/approvals', async (req, res) => {
   const f = req.isPlatform ? {} : { tenant: req.ctx.tenant, scope: 'tenant' };
   f.status = req.query.status ? { $in: String(req.query.status).split(',') } : 'pending';
   const items = await Approval.find(f).sort({ createdAt: -1 }).limit(200).populate('requestedBy', 'name email').populate('decidedBy', 'name email').populate('tenant', 'name').lean();
-  res.json({ approvals: items.map((a) => ({ ...a, canDecide: String(a.requestedBy?._id) !== String(req.user._id) && ROLES[req.ctx.role]?.perms.includes('approval.decide') && (a.scope === 'tenant' || req.isPlatform) })) });
+  res.json({ approvals: items.map((a) => ({ ...a, canDecide: String(a.requestedBy?._id) !== String(req.user._id) && roleDef(req.ctx.role)?.perms.includes('approval.decide') && (a.scope === 'tenant' || req.isPlatform) })) });
 });
 
 router.post('/approvals/:id/decide', can('approval.decide'), async (req, res) => {
@@ -304,7 +307,7 @@ router.get('/company', async (req, res) => {
   const id = writeTenant(req, req.query.tenant);
   const t = await Tenant.findById(id).lean();
   if (!t) throw notFound();
-  if (!ROLES[req.ctx.role]?.perms.includes('bank.manage')) delete t.bank;
+  if (!roleDef(req.ctx.role)?.perms.includes('bank.manage')) delete t.bank;
   res.json({ tenant: t });
 });
 
@@ -321,7 +324,7 @@ router.patch('/company', can('branding.manage', 'staff.manage'), async (req, res
     bank: z.object({ accountName: z.string(), accountNumber: z.string().regex(/^\d{9,18}$/), ifsc: z.string().regex(/^[A-Z]{4}0[A-Z0-9]{6}$/) }).optional(),
   }), req.body);
   const t = await Tenant.findById(writeTenant(req, b.tenant));
-  if (b.bank && !ROLES[req.ctx.role]?.perms.includes('bank.manage')) throw forbidden('Only the owner can change bank details.');
+  if (b.bank && !roleDef(req.ctx.role)?.perms.includes('bank.manage')) throw forbidden('Only the owner can change bank details.');
   const before = { branding: t.branding, pricesIncludeGst: t.pricesIncludeGst, bank: t.bank };
   if (b.branding) t.branding = { ...(t.branding?.toObject?.() || {}), ...b.branding };
   if (b.alertContacts) t.alertContacts = { ...(t.alertContacts?.toObject?.() || {}), ...b.alertContacts };

@@ -36,8 +36,7 @@ export async function requestOtp(phone, purpose = 'login', { channel = 'sms', la
   if (meta) state.meta = meta;
   await state.save();
 
-  if (channel === 'sms') await sendOtpSms(phone, code, lang);
-  else logger.info(`[otp:${channel}] -> ${maskPhone(phone)} (fallback channel, mocked)`);
+  await sendOtpSms(phone, code, lang, channel);
 
   return {
     sent: true,

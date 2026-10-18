@@ -20,6 +20,8 @@ const VehicleSchema = new Schema({
   connectorTypes: [String],
   batteryKwh: Number,
   registration: String,
+  // ISO 15118 Plug & Charge: contract identity issued by us as the eMSP
+  pnc: { emaid: String, certSerial: String, issuedAt: Date, revokedAt: Date },
 });
 
 const UserSchema = new Schema(

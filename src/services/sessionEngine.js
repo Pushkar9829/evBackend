@@ -21,6 +21,7 @@ import { raiseAlert, resolveAlerts } from './alerts.js';
 import { securityEvent } from './audit.js';
 import { events } from './events.js';
 import { sendCommand, isOnline } from '../ocpp/commands.js';
+import { cluster } from '../ocpp/cluster.js';
 
 const C = () => config.charging;
 const sessionLink = (s, token) => `${config.publicWebUrl}/s/${s._id}${token ? `?v=${token}` : ''}`;
@@ -41,7 +42,10 @@ export const FAILURE_MESSAGES = {
 
 async function publish(sessionOrId) {
   const s = sessionOrId?._id ? sessionOrId : await Session.findById(sessionOrId);
-  if (s) events.emit('session', s);
+  if (s) {
+    events.emit('session', s);
+    cluster().publishSession(s._id); // SSE clients on other nodes
+  }
   return s;
 }
 
@@ -350,6 +354,7 @@ export function readMeter(meterValue = [], quirks = {}) {
       const v = Number(sv.value) * mult;
       if (Number.isNaN(v)) continue;
       if (m === ENERGY && !sv.phase) out.wh = unit === 'kWh' || quirks.sendsWhAsKwh ? Math.round(v * 1000) : Math.round(v);
+      else if (m === 'Energy.Active.Export.Register' && !sv.phase) out.exportWh = unit === 'kWh' ? Math.round(v * 1000) : Math.round(v);
       else if (m === 'Power.Active.Import' && !sv.phase) out.powerW = unit === 'kW' ? v * 1000 : v;
       else if (m === 'SoC') out.soc = v;
       out.at = new Date(mv.timestamp);
@@ -466,6 +471,11 @@ export async function onTransactionEvent(charger, p) {
     if (r === 'rejected') logger.warn(`meter reading rejected for session ${s._id}: ${meter.wh} Wh`);
   }
   s.energyWh = energyOf(s);
+  // V2G (OCPP 2.1): energy returned to the grid, monotonic like the import register
+  if (meter.exportWh !== undefined) {
+    s.exportMeter = s.exportMeter?.startWh === undefined || s.exportMeter?.startWh === null ? { startWh: meter.exportWh, lastWh: meter.exportWh } : { startWh: s.exportMeter.startWh, lastWh: Math.max(s.exportMeter.lastWh, meter.exportWh) };
+    s.exportedWh = s.exportMeter.lastWh - s.exportMeter.startWh;
+  }
   if (meter.powerW !== undefined || meter.soc !== undefined) {
     s.live = s.live || {};
     if (meter.powerW !== undefined) {
@@ -543,15 +553,17 @@ async function onUnknownTransaction(charger, p) {
   // RFID card of a fleet / autopay driver started locally: create a postpaid session on the fly.
   const uid = p.idToken?.idToken;
   if (p.eventType === 'Started' && uid) {
-    const user = await User.findOne({ 'rfidCards.uid': uid, status: 'active' });
-    const card = user?.rfidCards.find((c) => c.uid === uid);
+    // Plug & Charge (ISO 15118): the car identified itself with a contract (eMAID) we issued.
+    const pncUser = await User.findOne({ vehicles: { $elemMatch: { 'pnc.emaid': uid, 'pnc.revokedAt': null } }, status: 'active' });
+    const user = pncUser || (await User.findOne({ 'rfidCards.uid': uid, status: 'active' }));
+    const card = pncUser ? { uid } : user?.rfidCards.find((c) => c.uid === uid);
     if (user && card && !card.blocked && (user.fleet || user.autopay?.status === 'active')) {
       const conn = charger.connectorByEvse(p.evse?.id, p.evse?.connectorId) || charger.connectors[0];
       const tenant = await Tenant.findById(charger.tenant).lean();
       const tariff = await activeTariff(charger.tenant, conn.tariffKey || charger.tariffKey);
       const s = await Session.create({
         tenant: charger.tenant, site: charger.site, charger: charger._id, ocppId: charger.ocppId, connectorNumber: conn.number, evseId: conn.evseId, connectorId: conn.connectorId,
-        driver: user._id, channel: 'rfid', state: 'STARTING', history: [{ state: 'STARTING', at: new Date(), note: 'rfid' }], tariff: snapshot(tariff, tenant), tariffId: tariff._id,
+        driver: user._id, channel: pncUser ? 'pnc' : 'rfid', state: 'STARTING', history: [{ state: 'STARTING', at: new Date(), note: pncUser ? 'plug & charge' : 'rfid' }], tariff: snapshot(tariff, tenant), tariffId: tariff._id,
         idToken: uid, transactionId: p.transactionInfo.transactionId, postpaid: true, capPaise: user.autopay?.maxPaise || 200000, fleet: user.fleet,
       });
       await lockConnector(s);
@@ -749,10 +761,18 @@ export async function onChargerOnline(charger) {
 }
 
 /** Answer Authorize for app/QR session tokens, RFID cards and roaming tokens (STA-11). */
-export async function authorizeToken(charger, idToken) {
+export async function authorizeToken(charger, idToken, { type } = {}) {
   if (!idToken) return 'Invalid';
   const s = await Session.findOne({ charger: charger._id, idToken, state: { $in: ['PAID', 'STARTING', 'CHARGING', 'STOPPING', 'INTERRUPTED'] } }).lean();
   if (s) return 'Accepted';
+  if (type === 'eMAID' || /^[A-Z]{2}-?[A-Z0-9]{3}-?C/.test(idToken)) {
+    const pnc = await User.findOne({ 'vehicles.pnc.emaid': idToken }).lean();
+    if (pnc) {
+      const v = pnc.vehicles.find((x) => x.pnc?.emaid === idToken);
+      if (pnc.status !== 'active' || v.pnc.revokedAt) return 'Blocked';
+      return pnc.fleet || pnc.autopay?.status === 'active' ? 'Accepted' : 'NoCredit';
+    }
+  }
   const user = await User.findOne({ 'rfidCards.uid': idToken }).lean();
   if (user) {
     const card = user.rfidCards.find((c) => c.uid === idToken);

@@ -1,16 +1,21 @@
 // Virtual charger for development and QA (Requirements 3 "Testing", UX doc Part 2).
 // Speaks OCPP 2.0.1 or 1.6J over a real WebSocket and can inject faults: drop the connection,
 // delay / duplicate / reorder messages, wrong meter values, register reset, reject start/stop, etc.
+// Also: OCPP 2.1 (V2G discharge), Security Profile 3 (CSR -> client certificate -> mutual TLS) and
+// ISO 15118 Plug & Charge (contract eMAID + certificate hash data).
 import WebSocket from 'ws';
+import forge from 'node-forge';
 import { randomId } from '../lib/util.js';
 
 const now = () => new Date(Date.now() + (VirtualCharger.clockOffsetMs || 0)).toISOString();
 
 export class VirtualCharger {
-  constructor({ url, ocppId, password, protocol = 'ocpp2.0.1', connectors = [{ number: 1, maxPowerKw: 7.4 }], vendor = 'SimCo', model = 'Sim-AC', firmware = '1.0.0', meterIntervalSec = 5, speed = 60, connectionTimeoutSec = 120 }) {
-    Object.assign(this, { url, ocppId, password, protocol, vendor, model, firmware, meterIntervalSec, speed, connectionTimeoutSec });
+  constructor({ url, ocppId, password, protocol = 'ocpp2.0.1', connectors = [{ number: 1, maxPowerKw: 7.4 }], vendor = 'SimCo', model = 'Sim-AC', firmware = '1.0.0', meterIntervalSec = 5, speed = 60, connectionTimeoutSec = 120, tlsUrl, ca }) {
+    Object.assign(this, { url, ocppId, password, protocol, vendor, model, firmware, meterIntervalSec, speed, connectionTimeoutSec, tlsUrl, ca });
+    this.certs = { installed: [], client: null, clientKey: null };
+    this.useTls = false; // switch to the TLS listener (with client certificate when we have one)
     this.connectors = connectors.map((c) => ({
-      number: c.number, maxPowerKw: c.maxPowerKw || 7.4, status: 'Available', plugged: false, tx: null, meterWh: c.meterWh ?? 1_000_000, evSuspended: false, locked: false,
+      number: c.number, maxPowerKw: c.maxPowerKw || 7.4, status: 'Available', plugged: false, tx: null, meterWh: c.meterWh ?? 1_000_000, exportWh: 0, dischargeKw: 0, evSuspended: false, locked: false,
     }));
     this.ws = null;
     this.pending = new Map();
@@ -42,8 +47,12 @@ export class VirtualCharger {
   connect() {
     this.wantOnline = true;
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`${this.url}/${encodeURIComponent(this.ocppId)}`, [this.protocol], {
-        headers: { Authorization: `Basic ${Buffer.from(`${this.ocppId}:${this.password}`).toString('base64')}` },
+      const tls = this.useTls && this.tlsUrl;
+      const withCert = tls && this.certs.client;
+      const ws = new WebSocket(`${tls ? this.tlsUrl : this.url}/${encodeURIComponent(this.ocppId)}`, [this.protocol], {
+        // Profile 3: client certificate instead of a password; Profile 2: Basic auth (over TLS when tls)
+        headers: withCert ? {} : { Authorization: `Basic ${Buffer.from(`${this.ocppId}:${this.password}`).toString('base64')}` },
+        ...(tls ? { ca: this.ca, ...(withCert ? { cert: this.certs.client, key: this.certs.clientKey } : {}) } : {}),
       });
       this.ws = ws;
       let opened = false;
@@ -211,7 +220,7 @@ export class VirtualCharger {
     if (this.faults.wrongMeterNext === 'backwards') wh = c.meterWh - 5000;
     if (this.faults.wrongMeterNext === 'jump') wh = c.meterWh + 900_000;
     if (this.faults.wrongMeterNext) this.faults.wrongMeterNext = null;
-    const powerW = c.tx && !c.evSuspended ? c.maxPowerKw * 1000 : 0;
+    const powerW = c.tx && !c.evSuspended ? (c.dischargeKw ? -c.dischargeKw * 1000 : c.maxPowerKw * 1000) : 0;
     if (this.is16) {
       return [{ timestamp: now(), sampledValue: [
         { value: String(wh), measurand: 'Energy.Active.Import.Register', unit: 'Wh', context: context || 'Sample.Periodic' },
@@ -221,6 +230,8 @@ export class VirtualCharger {
     }
     return [{ timestamp: now(), sampledValue: [
       { value: wh, measurand: 'Energy.Active.Import.Register', unitOfMeasure: { unit: 'Wh' }, context: context || 'Sample.Periodic' },
+      // OCPP 2.1 bidirectional chargers report the export register from the start of the transaction
+      ...(this.protocol === 'ocpp2.1' ? [{ value: c.exportWh, measurand: 'Energy.Active.Export.Register', unitOfMeasure: { unit: 'Wh' } }] : []),
       { value: powerW, measurand: 'Power.Active.Import', unitOfMeasure: { unit: 'W' } },
       ...(c.soc !== undefined ? [{ value: Math.round(c.soc), measurand: 'SoC', unitOfMeasure: { unit: 'Percent' } }] : []),
     ] }];
@@ -231,7 +242,7 @@ export class VirtualCharger {
     return this.seq[c.tx.id];
   }
 
-  async startTx(c, { idToken, remoteStartId }) {
+  async startTx(c, { idToken, remoteStartId, tokenType = 'Central' }) {
     if (c.tx) return;
     if (this.is16) {
       let ready;
@@ -245,7 +256,7 @@ export class VirtualCharger {
       await this.call('TransactionEvent', {
         eventType: 'Started', timestamp: now(), triggerReason: remoteStartId ? 'RemoteStart' : 'Authorized', seqNo: this.nextSeq(c),
         transactionInfo: { transactionId: c.tx.id, chargingState: 'Charging', remoteStartId },
-        idToken: { idToken, type: 'Central' }, evse: { id: c.number, connectorId: 1 }, meterValue: this.meterSample(c, { context: 'Transaction.Begin' }),
+        idToken: { idToken, type: tokenType }, evse: { id: c.number, connectorId: 1 }, meterValue: this.meterSample(c, { context: 'Transaction.Begin' }),
       });
     }
     await this.sendStatus(c);
@@ -283,7 +294,9 @@ export class VirtualCharger {
   async tick() {
     for (const c of this.connectors) {
       if (!c.tx) continue;
-      if (!c.evSuspended) {
+      if (c.dischargeKw) {
+        c.exportWh += Math.round(c.dischargeKw * 1000 * ((this.meterIntervalSec * this.speed) / 3600)); // V2G: power flows back
+      } else if (!c.evSuspended) {
         const hours = (this.meterIntervalSec * this.speed) / 3600; // speed: 60 => one interval = one minute of charging
         c.meterWh += Math.round(c.maxPowerKw * 1000 * hours);
         if (c.soc !== undefined) c.soc = Math.min(100, c.soc + (c.maxPowerKw * hours * 100) / (c.batteryKwh || 40));
@@ -347,6 +360,28 @@ export class VirtualCharger {
     const c = this.conn(n);
     c.meterWh = 0;
     await this.sendMeter(c);
+  }
+
+  /** ISO 15118 Plug & Charge: the car presents its contract; no app, no card. */
+  async plugInPnc(n, { emaid, hashData }) {
+    const c = this.conn(n);
+    c.plugged = true;
+    await this.sendStatus(c);
+    const auth = await this.call('Authorize', { idToken: { idToken: emaid, type: 'eMAID' }, iso15118CertificateHashData: hashData ? [{ ...hashData, responderURL: 'http://ocsp.chargex.test' }] : undefined });
+    const status = auth?.idTokenInfo?.status;
+    if (status === 'Accepted') await this.startTx(c, { idToken: emaid, tokenType: 'eMAID' });
+    return { status, certificateStatus: auth?.certificateStatus };
+  }
+
+  /** Security Profile 3 step: new key pair + CSR with CN = charger id, sent as SignCertificate. */
+  async requestCertificate() {
+    const keys = forge.pki.rsa.generateKeyPair(2048);
+    const csr = forge.pki.createCertificationRequest();
+    csr.publicKey = keys.publicKey;
+    csr.setSubject([{ name: 'commonName', value: this.ocppId }, { name: 'organizationName', value: this.vendor }]);
+    csr.sign(keys.privateKey, forge.md.sha256.create());
+    this.certs.pendingKey = forge.pki.privateKeyToPem(keys.privateKey);
+    return this.call('SignCertificate', this.is16 ? { csr: forge.pki.certificationRequestToPem(csr) } : { csr: forge.pki.certificationRequestToPem(csr), certificateType: 'ChargingStationCertificate' });
   }
 
   async swipeRfid(n, uid) {
@@ -421,6 +456,7 @@ export class VirtualCharger {
           if (msg === 'Heartbeat') await this.call('Heartbeat', {});
           if (msg === 'BootNotification') await this.boot();
           if (msg === 'MeterValues' || msg === 'TransactionEvent') for (const c of this.connectors) await this.sendMeter(c);
+          if (msg === 'SignChargingStationCertificate') await this.requestCertificate();
         }, 100);
         return { status: 'Accepted' };
       }
@@ -439,11 +475,20 @@ export class VirtualCharger {
       case 'SendLocalList':
         this.localList = p;
         return { status: 'Accepted' };
-      case 'SetChargingProfile':
+      case 'SetChargingProfile': {
         this.chargingProfile = p;
+        // OCPP 2.1 bidirectional: a negative setpoint means discharge to the grid
+        const period = p.chargingProfile?.chargingSchedule?.[0]?.chargingSchedulePeriod?.[0];
+        if (period?.setpoint < 0) {
+          if (this.protocol !== 'ocpp2.1' || !this.v2gAllowed) return { status: 'Rejected' };
+          const c = this.connectors.find((x) => x.number === p.evseId) || this.connectors[0];
+          c.dischargeKw = -period.setpoint / 1000;
+        }
         return { status: 'Accepted' };
+      }
       case 'ClearChargingProfile':
         this.chargingProfile = null;
+        for (const c of this.connectors) c.dischargeKw = 0;
         return { status: 'Accepted' };
       case 'ReserveNow': {
         const c = this.conn(this.is16 ? p.connectorId : p.evseId);
@@ -464,6 +509,28 @@ export class VirtualCharger {
       }
       case 'DataTransfer':
         return { status: 'Accepted' };
+      case 'InstallCertificate':
+        this.certs.installed.push({ certificateType: p.certificateType, pem: p.certificate, serial: String(Date.now()) });
+        return { status: 'Accepted' };
+      case 'GetInstalledCertificateIds':
+        return { status: this.certs.installed.length ? 'Accepted' : 'NotFound', certificateHashDataChain: this.certs.installed.map((x) => ({ certificateType: x.certificateType, certificateHashData: { hashAlgorithm: 'SHA256', issuerNameHash: 'sim', issuerKeyHash: 'sim', serialNumber: x.serial } })) };
+      case 'DeleteCertificate': {
+        const before = this.certs.installed.length;
+        this.certs.installed = this.certs.installed.filter((x) => x.serial !== p.certificateHashData?.serialNumber);
+        return { status: before === this.certs.installed.length ? 'NotFound' : 'Accepted' };
+      }
+      case 'CertificateSigned':
+        if (!this.certs.pendingKey) return { status: 'Rejected' };
+        this.certs.client = p.certificateChain;
+        this.certs.clientKey = this.certs.pendingKey;
+        this.certs.pendingKey = null;
+        return { status: 'Accepted' };
+      case 'ExtendedTriggerMessage':
+        if (p.requestedMessage === 'SignChargePointCertificate') setTimeout(() => this.requestCertificate().catch(() => {}), 100);
+        return { status: 'Accepted' };
+      case 'NotifyAllowedEnergyTransfer':
+        this.v2gAllowed = p.allowedEnergyTransfer;
+        return { status: this.protocol === 'ocpp2.1' ? 'Accepted' : 'Rejected' };
       default:
         return this.is16 ? {} : { status: 'Rejected' };
     }
@@ -477,7 +544,9 @@ export class VirtualCharger {
       queued: this.queue.length,
       faults: this.faults,
       firmware: this.firmware,
-      connectors: this.connectors.map((c) => ({ number: c.number, status: c.status, plugged: c.plugged, meterWh: c.meterWh, tx: c.tx ? { id: c.tx.id, startedAt: c.tx.startedAt } : null, evSuspended: c.evSuspended, faulted: !!c.faulted, maxPowerKw: c.maxPowerKw, pendingStart: !!this.pendingStarts[c.number] })),
+      securityProfile: this.certs.client ? 3 : 2,
+      hasClientCert: !!this.certs.client,
+      connectors: this.connectors.map((c) => ({ number: c.number, status: c.status, plugged: c.plugged, meterWh: c.meterWh, exportWh: c.exportWh, dischargeKw: c.dischargeKw, tx: c.tx ? { id: c.tx.id, startedAt: c.tx.startedAt } : null, evSuspended: c.evSuspended, faulted: !!c.faulted, maxPowerKw: c.maxPowerKw, pendingStart: !!this.pendingStarts[c.number] })),
       log: this.log.slice(-40),
     };
   }

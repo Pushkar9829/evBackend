@@ -14,6 +14,7 @@ import { createSession, requestStop } from '../../services/sessionEngine.js';
 import { CONNECTOR_TYPES } from '../../models/charger.js';
 import { pushLocation } from '../../roaming/ocpi/client.js';
 import { flagOn } from '../../services/settings.js';
+import { rootCaPem } from '../../services/pki.js';
 
 const router = express.Router();
 const CRITICAL_KEYS = new Set(['SecurityProfile', 'BasicAuthPassword', 'AuthorizationKey', 'NetworkConfigurationPriority', 'CentralSystemURL', 'NetworkProfile', 'Identity']);
@@ -80,7 +81,7 @@ router.get('/chargers/:id', can('charger.view'), async (req, res) => {
   delete c.passwordHash;
   const sessions = await Session.find({ charger: c._id }).sort({ createdAt: -1 }).limit(10).select('state energyWh costs.totalPaise createdAt connectorNumber failureReason').lean();
   const commands = await CommandLog.find({ charger: c._id }).sort({ createdAt: -1 }).limit(20).populate('requestedBy', 'name email').lean();
-  res.json({ charger: c, sessions, commands, ocppUrl: `${config.publicApiUrl.replace(/^http/, 'ws')}/ocpp/${encodeURIComponent(c.ocppId)}` });
+  res.json({ charger: c, sessions, commands, ocppUrl: `${config.publicApiUrl.replace(/^http/, 'ws')}/ocpp/${encodeURIComponent(c.ocppId)}`, tlsOcppUrl: process.env.OCPP_TLS_PUBLIC_URL ? `${process.env.OCPP_TLS_PUBLIC_URL}/ocpp/${encodeURIComponent(c.ocppId)}` : null });
 });
 
 const connectorSchema = z.object({
@@ -100,7 +101,7 @@ router.post('/chargers', can('charger.manage'), async (req, res) => {
     site: z.string(),
     ocppId: z.string().min(3).max(48).regex(/^[A-Za-z0-9._\-*]+$/, 'Use letters, digits, dot, dash, underscore'),
     label: z.string().max(80).optional(),
-    protocol: z.enum(['ocpp2.0.1', 'ocpp1.6']).default('ocpp2.0.1'),
+    protocol: z.enum(['ocpp2.0.1', 'ocpp2.1', 'ocpp1.6']).default('ocpp2.0.1'),
     vendor: z.string().max(60).optional(),
     model: z.string().max(60).optional(),
     connectors: z.array(connectorSchema).min(1).max(8),
@@ -172,7 +173,11 @@ router.get('/chargers/:id/messages', can('ocpp.log.view'), async (req, res) => {
 // ------------------------------------------------------------- command centre
 
 const commandSchema = z.object({
-  action: z.enum(['remote_start', 'remote_stop', 'reset', 'unlock', 'availability', 'get_config', 'set_config', 'trigger', 'firmware', 'get_log', 'local_list', 'clear_cache']),
+  action: z.enum(['remote_start', 'remote_stop', 'reset', 'unlock', 'availability', 'get_config', 'set_config', 'trigger', 'firmware', 'get_log', 'local_list', 'clear_cache', 'install_root', 'renew_certificate', 'list_certificates', 'delete_certificate', 'security_profile', 'v2g_discharge', 'v2g_stop']),
+  profile: z.number().int().min(2).max(3).optional(),
+  kw: z.number().positive().max(350).optional(),
+  minutes: z.number().int().min(1).max(600).optional(),
+  certificateHashData: z.record(z.any()).optional(),
   connector: z.number().int().positive().optional(),
   sessionId: z.string().optional(),
   reason: z.string().max(300).optional(),
@@ -187,7 +192,7 @@ const commandSchema = z.object({
   confirm: z.boolean().optional(),
 });
 
-const PERM = { remote_start: 'session.remote', remote_stop: 'session.remote', reset: 'charger.command', unlock: 'charger.command', availability: 'charger.command', get_config: 'charger.config', set_config: 'charger.config', trigger: 'charger.command', firmware: 'charger.firmware', get_log: 'charger.command', local_list: 'charger.command', clear_cache: 'charger.command' };
+const PERM = { remote_start: 'session.remote', remote_stop: 'session.remote', reset: 'charger.command', unlock: 'charger.command', availability: 'charger.command', get_config: 'charger.config', set_config: 'charger.config', trigger: 'charger.command', firmware: 'charger.firmware', get_log: 'charger.command', local_list: 'charger.command', clear_cache: 'charger.command', install_root: 'charger.config', renew_certificate: 'charger.config', list_certificates: 'charger.config', delete_certificate: 'charger.config.critical', security_profile: 'charger.config', v2g_discharge: 'smart.manage', v2g_stop: 'smart.manage' };
 
 export async function runChargerCommand(req, charger, b) {
   const conn = b.connector ? charger.connector(b.connector) : null;
@@ -248,12 +253,67 @@ export async function runChargerCommand(req, charger, b) {
       if (r.status === 'Accepted') await Charger.updateOne({ _id: charger._id }, { $set: { localAuthListVersion: version } });
       return r;
     }
+    // ---- Security Profile 3 / certificate management (A02-A05, M03-M05)
+    case 'install_root':
+      return sendCommand(charger, 'InstallCertificate', { certificateType: 'CSMSRootCertificate', certificate: await rootCaPem() }, opts);
+    case 'renew_certificate':
+      return sendCommand(charger, 'TriggerMessage', { requestedMessage: 'SignChargingStationCertificate' }, opts);
+    case 'list_certificates': {
+      const r = await sendCommand(charger, 'GetInstalledCertificateIds', { certificateType: ['CSMSRootCertificate', 'V2GRootCertificate', 'MORootCertificate', 'ManufacturerRootCertificate', 'V2GCertificateChain'] }, opts);
+      if (r.status === 'Accepted') await Charger.updateOne({ _id: charger._id }, { $set: { installedCertificates: (r.response?.certificateHashDataChain || []).map((c) => ({ certificateType: c.certificateType, serial: c.certificateHashData?.serialNumber, at: new Date() })) } });
+      return r;
+    }
+    case 'delete_certificate':
+      if (!b.certificateHashData) throw badRequest('HASH_REQUIRED', 'certificateHashData is required.');
+      return sendCommand(charger, 'DeleteCertificate', { certificateHashData: b.certificateHashData }, opts);
+    case 'security_profile': {
+      const profile = b.profile || 3;
+      if (profile === 3 && !(charger.certificate?.notAfter > new Date())) throw badRequest('NO_CERTIFICATE', 'The charger needs a valid client certificate first: install the root CA, then renew the certificate.');
+      if (!req.approvedExecution) {
+        const a = await requestApproval(req, { type: 'security_profile', tenant: charger.tenant, payload: { chargerId: String(charger._id), profile }, summary: `Move ${charger.ocppId} to Security Profile ${profile}`, reason: b.reason || 'security upgrade' });
+        return { status: 'PendingApproval', approvalId: a._id };
+      }
+      const r = await sendCommand(charger, 'SetVariables', { setVariableData: [{ component: { name: 'SecurityCtrlr' }, variable: { name: 'SecurityProfile' }, attributeValue: String(profile) }] }, opts);
+      if (r.status === 'Accepted') await Charger.updateOne({ _id: charger._id }, { $set: { securityProfile: profile } });
+      return r;
+    }
+    // ---- V2G discharge (OCPP 2.1 bidirectional power transfer)
+    case 'v2g_discharge': {
+      if (charger.protocol !== 'ocpp2.1') throw badRequest('NOT_V2G', 'Discharging needs an OCPP 2.1 charger.');
+      const s = await Session.findOne({ charger: charger._id, connectorNumber: b.connector || 1, state: 'CHARGING' });
+      if (!s?.transactionId) throw badRequest('NO_SESSION', 'V2G runs inside an active session.');
+      if (!req.approvedExecution) {
+        const a = await requestApproval(req, { type: 'v2g_discharge', tenant: charger.tenant, payload: { chargerId: String(charger._id), connector: b.connector || 1, kw: b.kw || 7, minutes: b.minutes || 30 }, summary: `Discharge ${b.kw || 7} kW for ${b.minutes || 30} min on ${charger.ocppId}`, reason: b.reason || 'grid support' });
+        return { status: 'PendingApproval', approvalId: a._id };
+      }
+      const conn = charger.connector(b.connector || 1);
+      const allow = await sendCommand(charger, 'NotifyAllowedEnergyTransfer', { transactionId: s.transactionId, allowedEnergyTransfer: [conn.powerType === 'DC' ? 'DC_BPT' : 'AC_BPT'] }, opts);
+      if (allow.status !== 'Accepted') return allow;
+      return sendCommand(charger, 'SetChargingProfile', {
+        evseId: conn.evseId,
+        chargingProfile: { id: 900, stackLevel: 1, chargingProfilePurpose: 'TxProfile', chargingProfileKind: 'Relative', transactionId: s.transactionId, chargingSchedule: [{ id: 1, chargingRateUnit: 'W', duration: (b.minutes || 30) * 60, chargingSchedulePeriod: [{ startPeriod: 0, setpoint: -Math.round((b.kw || 7) * 1000), operationMode: 'CentralSetpoint' }] }] },
+      }, opts);
+    }
+    case 'v2g_stop':
+      return sendCommand(charger, 'ClearChargingProfile', { chargingProfileId: 900 }, opts);
     case 'clear_cache':
       return sendCommand(charger, 'ClearCache', {}, opts);
     default:
       throw badRequest('UNKNOWN_ACTION', 'Unknown action.');
   }
 }
+
+registerExecutor('security_profile', async (a, req) => {
+  const charger = await Charger.findById(a.payload.chargerId);
+  const r = await runChargerCommand({ ...req, approvedExecution: true }, charger, { action: 'security_profile', profile: a.payload.profile, reason: a.reason });
+  return { status: r.status };
+});
+
+registerExecutor('v2g_discharge', async (a, req) => {
+  const charger = await Charger.findById(a.payload.chargerId);
+  const r = await runChargerCommand({ ...req, approvedExecution: true }, charger, { action: 'v2g_discharge', connector: a.payload.connector, kw: a.payload.kw, minutes: a.payload.minutes, reason: a.reason });
+  return { status: r.status };
+});
 
 registerExecutor('critical_config', async (a, req) => {
   const charger = await Charger.findById(a.payload.chargerId);

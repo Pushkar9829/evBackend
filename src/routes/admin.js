@@ -17,6 +17,9 @@ import { pullPartnerLocations, ocpiFetch } from '../roaming/ocpi/client.js';
 import { platformKeys, UEI_SUBSCRIBER_ID } from '../roaming/uei/routes.js';
 import { config } from '../config.js';
 import { computeBill } from '../services/tariffs.js';
+import { anonymiseGuest, anonymiseUser, exportData } from '../services/privacy.js';
+import { providerStatus } from '../services/providers.js';
+import { cluster } from '../ocpp/cluster.js';
 
 const router = express.Router();
 router.use(requireStaff, (req, _res, next) => (req.isPlatform ? next() : next(forbidden('Platform team only.'))));
@@ -178,6 +181,9 @@ router.get('/health', can('platform.health'), async (_req, res) => {
     queues: { refunds: refundQueue, financeQueue, cdrs: pendingCdrs, openAlerts },
     switches: { pauseNewPayments: s.pauseNewPayments, gatewayDown: s.gatewayDown, maintenance: s.maintenanceBanner?.active },
     process: { memoryMb: Math.round(process.memoryUsage().rss / 1048576), node: process.version },
+    providers: providerStatus(),
+    cluster: { enabled: cluster().enabled, nodeId: cluster().nodeId, leader: cluster().isLeader() },
+    tls: { profile3Listener: !!process.env.OCPP_TLS_PORT, ccp: !!process.env.CCP_URL },
   });
 });
 
@@ -405,7 +411,53 @@ router.get('/security-events', can('audit.view'), async (req, res) => {
   res.json({ events: await SecurityEvent.find(req.query.type ? { type: req.query.type } : {}).sort({ at: -1 }).limit(300).lean() });
 });
 
-router.get('/data-requests', can('tenant.view_all'), async (_req, res) => res.json({ requests: await DataRequest.find().sort({ createdAt: -1 }).limit(200).lean() }));
+router.get('/data-requests', can('tenant.view_all'), async (req, res) => {
+  const f = req.query.status ? { status: { $in: String(req.query.status).split(',') } } : {};
+  const items = await DataRequest.find(f).sort({ createdAt: -1 }).limit(300).populate('user', 'name phone status').populate('handledBy', 'name').lean();
+  res.json({ requests: items.map((r) => ({ ...r, phone: maskPhone(r.phone || r.user?.phone), user: r.user && { _id: r.user._id, name: r.user.name, status: r.user.status }, overdue: ['received', 'in_progress'].includes(r.status) && r.dueAt && r.dueAt < new Date() })) });
+});
+
+router.post('/data-requests/:id', can('customer.pii', 'tenant.manage'), async (req, res) => {
+  const b = parse(z.object({ status: z.enum(['in_progress', 'rejected']), note: z.string().min(3) }), req.body);
+  const r = await DataRequest.findById(req.params.id);
+  if (!r) throw notFound();
+  if (['completed', 'rejected'].includes(r.status)) throw conflict('CLOSED', 'This request is closed.');
+  r.status = b.status;
+  r.handledBy = req.user._id;
+  r.notes = b.note;
+  r.history.push({ status: b.status, at: new Date(), by: req.user._id, note: b.note });
+  await r.save();
+  await audit(req, { action: `data_request.${b.status}`, entity: 'DataRequest', entityId: r._id, reason: b.note });
+  res.json({ request: r });
+});
+
+/** Carry out the request: export returns the data; delete anonymises the person everywhere. */
+router.post('/data-requests/:id/execute', can('customer.pii', 'tenant.manage'), async (req, res) => {
+  const b = parse(z.object({ note: z.string().min(3) }), req.body);
+  const r = await DataRequest.findById(req.params.id);
+  if (!r) throw notFound();
+  if (['completed', 'rejected'].includes(r.status)) throw conflict('CLOSED', 'This request is closed.');
+  let result;
+  let data;
+  if (r.kind === 'export') {
+    data = await exportData({ userId: r.user, phone: r.phone });
+    result = { sessions: data.sessions.length, invoices: data.invoices.length };
+  } else if (r.user) {
+    const u = await User.findById(r.user);
+    result = u && u.status !== 'deleted' ? await anonymiseUser(u) : { alreadyDeleted: true };
+  } else {
+    result = await anonymiseGuest(r.phone);
+    r.phone = undefined;
+  }
+  r.status = 'completed';
+  r.completedAt = new Date();
+  r.handledBy = req.user._id;
+  r.result = result;
+  r.history.push({ status: 'completed', at: new Date(), by: req.user._id, note: b.note });
+  await r.save();
+  await audit(req, { action: `data_request.execute_${r.kind}`, entity: 'DataRequest', entityId: r._id, after: result, reason: b.note });
+  res.json({ request: r, data });
+});
 
 // ------------------------------------------------------------- platform staff
 

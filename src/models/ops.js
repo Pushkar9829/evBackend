@@ -111,12 +111,20 @@ const SecurityEventSchema = new Schema({
   at: { type: Date, default: Date.now, index: true },
 });
 
+// Data rights requests (DPDP Act): export or deletion, tracked to completion (Admin 3.4).
 const DataRequestSchema = new Schema(
   {
     user: { type: Types.ObjectId, ref: 'User' },
+    phone: String, // guests (no account) are identified by their verified phone number
     kind: { type: String, enum: ['delete', 'export'], default: 'delete' },
-    status: { type: String, enum: ['received', 'in_progress', 'completed', 'rejected'], default: 'received' },
+    status: { type: String, enum: ['received', 'in_progress', 'completed', 'rejected'], default: 'received', index: true },
+    source: { type: String, enum: ['self_service', 'driver_request', 'guest_request', 'support'], default: 'driver_request' },
+    reason: String,
     notes: String,
+    dueAt: Date,
+    handledBy: { type: Types.ObjectId, ref: 'User' },
+    history: [{ status: String, at: Date, by: { type: Types.ObjectId, ref: 'User' }, note: String, _id: false }],
+    result: Schema.Types.Mixed,
     completedAt: Date,
   },
   { timestamps: true },

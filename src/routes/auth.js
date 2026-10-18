@@ -6,7 +6,8 @@ import { Tenant, User, Session } from '../models/index.js';
 import { config, isTest } from '../config.js';
 import { parse, phoneSchema, z } from '../lib/validate.js';
 import { AppError, badRequest, unauthorized } from '../lib/errors.js';
-import { ROLES, roleNeeds2fa } from '../lib/permissions.js';
+import { roleDef, roleNeeds2fa } from '../lib/permissions.js';
+import { ensureRoles } from '../services/roles.js';
 import { requestOtp, verifyOtp } from '../services/otp.js';
 import { signToken, requireAuth } from '../middleware/auth.js';
 import { getSettings } from '../services/settings.js';
@@ -44,7 +45,10 @@ router.post('/otp/verify', ipLimit, async (req, res) => {
 const staffContexts = (user) => {
   const out = [];
   if (user.platformRole) out.push({ role: user.platformRole, scope: 'platform', tenant: null });
-  for (const m of user.memberships) out.push({ role: m.role, scope: ROLES[m.role]?.scope || 'tenant', tenant: String(m.tenant) });
+  for (const m of user.memberships) {
+    const def = roleDef(m.role);
+    if (def) out.push({ role: m.role, roleName: def.custom ? def.name : undefined, scope: def.scope || 'tenant', tenant: String(m.tenant) });
+  }
   return out;
 };
 
@@ -62,6 +66,7 @@ router.post('/staff/login', ipLimit, async (req, res) => {
     throw unauthorized('Email or password is incorrect.');
   }
   if (user.status !== 'active') throw new AppError(403, 'BLOCKED', 'This account is disabled.');
+  await ensureRoles(user.memberships.map((m) => m.role));
   const contexts = staffContexts(user);
   if (!contexts.length) throw new AppError(403, 'NO_ROLE', 'This account has no staff role.');
   const ctx = (b.tenant && contexts.find((c) => c.tenant === b.tenant)) || contexts[0];
@@ -102,6 +107,7 @@ router.post('/staff/2fa', ipLimit, async (req, res) => {
 router.post('/staff/switch', requireAuth, async (req, res) => {
   if (req.auth.kind !== 'staff') throw unauthorized();
   const b = parse(z.object({ tenant: z.string().nullable().optional(), role: z.string().optional() }), req.body);
+  await ensureRoles(req.user.memberships.map((m) => m.role));
   const contexts = staffContexts(req.user);
   const ctx = contexts.find((c) => (b.tenant ? c.tenant === b.tenant : c.scope === 'platform') && (!b.role || c.role === b.role));
   if (!ctx) throw badRequest('NO_ACCESS', 'You do not have access to that workspace.');
@@ -121,9 +127,10 @@ router.post('/host-session', requireAuth, async (req, res) => {
 router.get('/me', requireAuth, async (req, res) => {
   const u = req.user.toPublic();
   if (req.auth.kind === 'staff') {
+    await ensureRoles(req.user.memberships.map((m) => m.role));
     const contexts = staffContexts(req.user);
     const tenants = await Tenant.find({ _id: { $in: contexts.filter((c) => c.tenant).map((c) => c.tenant) } }).select('name type slug').lean();
-    return res.json({ kind: 'staff', user: u, ctx: req.ctx, permissions: ROLES[req.ctx.role]?.perms || [], contexts: contexts.map((c) => ({ ...c, tenantName: tenants.find((t) => String(t._id) === c.tenant)?.name })) });
+    return res.json({ kind: 'staff', user: u, ctx: req.ctx, permissions: roleDef(req.ctx.role)?.perms || [], contexts: contexts.map((c) => ({ ...c, tenantName: tenants.find((t) => String(t._id) === c.tenant)?.name })) });
   }
   return res.json({ kind: 'driver', user: u });
 });

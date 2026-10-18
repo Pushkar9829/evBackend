@@ -152,8 +152,9 @@ router.get('/:id/events', async (req, res) => {
     }
   };
   await send(s);
-  const onSession = (doc) => {
-    if (String(doc._id) === String(s._id)) send(doc);
+  const onSession = async (doc) => {
+    if (String(doc._id) !== String(s._id)) return;
+    send(doc.remote ? await Session.findById(s._id) : doc);
   };
   events.on('session', onSession);
   const ping = setInterval(() => res.write(': ping\n\n'), 20000);

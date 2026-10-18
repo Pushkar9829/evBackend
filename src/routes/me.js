@@ -7,6 +7,8 @@ import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { randomToken, randomId } from '../lib/util.js';
 import { requireDriver } from '../middleware/auth.js';
 import { audit } from '../services/audit.js';
+import { anonymiseUser, exportData, openRequest } from '../services/privacy.js';
+import { IssuedCertificate, issueContractCertificate } from '../services/pki.js';
 import { getSettings } from '../services/settings.js';
 import { sessionView } from './sessions.js';
 import { publicCharger } from './public.js';
@@ -45,6 +47,30 @@ router.post('/vehicles', async (req, res) => {
   req.user.vehicles.push(b);
   await req.user.save();
   res.status(201).json({ vehicles: req.user.vehicles });
+});
+
+/** Plug & Charge: issue an ISO 15118 contract (eMAID + certificate) for a vehicle. Billing is postpaid. */
+router.post('/vehicles/:vid/pnc', async (req, res) => {
+  const v = req.user.vehicles.id(req.params.vid);
+  if (!v) throw notFound('Vehicle not found.');
+  if (!(req.user.autopay?.status === 'active' || req.user.fleet)) throw badRequest('AUTOPAY_REQUIRED', 'Plug & Charge bills after the session: set up UPI Autopay or join a fleet first.');
+  if (v.pnc?.emaid && !v.pnc.revokedAt) throw conflict('PNC_ACTIVE', 'Plug & Charge is already on for this vehicle.');
+  const c = await issueContractCertificate(req.user);
+  v.pnc = { emaid: c.emaid, certSerial: c.hash.serialNumber, issuedAt: new Date() };
+  await req.user.save();
+  await audit(req, { action: 'driver.pnc_enable', entity: 'User', entityId: req.user._id, after: { emaid: c.emaid, vehicle: v.label || v.model } });
+  // The certificate + key are provisioned into the car (OEM backend / CCP). Shown once.
+  res.status(201).json({ emaid: c.emaid, certificateChain: c.chain, privateKey: c.key, hashData: c.hash, note: 'Provision this contract into the vehicle via its OEM backend or a Contract Certificate Pool. The private key is shown once.' });
+});
+
+router.delete('/vehicles/:vid/pnc', async (req, res) => {
+  const v = req.user.vehicles.id(req.params.vid);
+  if (!v?.pnc?.emaid) throw notFound('Plug & Charge is not on for this vehicle.');
+  await IssuedCertificate.updateMany({ emaid: v.pnc.emaid, revokedAt: null }, { $set: { revokedAt: new Date() } });
+  v.pnc.revokedAt = new Date();
+  await req.user.save();
+  await audit(req, { action: 'driver.pnc_revoke', entity: 'User', entityId: req.user._id, after: { emaid: v.pnc.emaid } });
+  res.json({ ok: true });
 });
 
 router.delete('/vehicles/:vid', async (req, res) => {
@@ -145,14 +171,29 @@ router.post('/rfid', async (req, res) => {
 // ------------------------------------------------------------- delete account (ACC-08)
 
 router.delete('/', async (req, res) => {
-  const active = await Session.exists({ driver: req.user._id, state: { $in: ['PAID', 'STARTING', 'CHARGING', 'STOPPING', 'INTERRUPTED'] } });
-  if (active) throw conflict('ACTIVE_SESSION', 'Please finish your charging session first.');
-  await DataRequest.create({ user: req.user._id, kind: 'delete', status: 'completed', completedAt: new Date(), notes: 'Self-service: profile anonymised, invoices kept for the tax period' });
   const id = req.user._id;
-  req.user.set({ phone: undefined, email: undefined, name: 'Deleted user', vehicles: [], favourites: [], savedMethods: [], pushTokens: [], rfidCards: [], gstin: undefined, status: 'deleted', deletedAt: new Date(), sessionVersion: (req.user.sessionVersion || 0) + 1 });
-  await req.user.save();
-  await audit(req, { action: 'driver.delete_account', entity: 'User', entityId: id });
+  const result = await anonymiseUser(req.user);
+  await DataRequest.create({ user: id, kind: 'delete', source: 'self_service', status: 'completed', completedAt: new Date(), result, history: [{ status: 'completed', at: new Date(), note: 'self-service' }], notes: 'Profile anonymised; invoices kept for the tax period without name/phone' });
+  await audit(req, { action: 'driver.delete_account', entity: 'User', entityId: id, after: result });
   res.json({ ok: true });
+});
+
+/** Download everything we hold about the driver (DPDP right of access). */
+router.get('/data-export', async (req, res) => {
+  const data = await exportData({ userId: req.user._id });
+  await DataRequest.create({ user: req.user._id, kind: 'export', source: 'self_service', status: 'completed', completedAt: new Date(), history: [{ status: 'completed', at: new Date(), note: 'self-service export' }] });
+  res.setHeader('Content-Disposition', 'attachment; filename="chargex-my-data.json"');
+  res.json(data);
+});
+
+router.get('/data-requests', async (req, res) => {
+  res.json({ requests: await DataRequest.find({ user: req.user._id }).sort({ createdAt: -1 }).select('kind status source createdAt dueAt completedAt notes').lean() });
+});
+
+router.post('/data-requests', async (req, res) => {
+  const b = parse(z.object({ kind: z.enum(['delete', 'export']), reason: z.string().max(500).optional() }), req.body);
+  const r = await openRequest({ user: req.user, kind: b.kind, source: 'driver_request', reason: b.reason });
+  res.status(201).json({ request: r });
 });
 
 // ------------------------------------------------------------- Host mode (Individual Hosts, Phase 2)

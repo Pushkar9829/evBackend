@@ -66,3 +66,41 @@ const SiteSchema = new Schema(
 export const Tenant = model('Tenant', TenantSchema);
 export const CommissionRule = model('CommissionRule', CommissionRuleSchema);
 export const Site = model('Site', SiteSchema);
+
+// Tenant-defined roles built from the same permission list (Phase 3). Memberships reference them as "custom:<id>".
+const CustomRoleSchema = new Schema(
+  {
+    tenant: { type: Types.ObjectId, ref: 'Tenant', required: true, index: true },
+    name: { type: String, required: true },
+    description: String,
+    perms: [String],
+    scope: { type: String, enum: ['tenant', 'site'], default: 'tenant' },
+    refundLimitPaise: { type: Number, default: 0 },
+    basedOn: String,
+    archived: { type: Boolean, default: false },
+    createdBy: { type: Types.ObjectId, ref: 'User' },
+  },
+  { timestamps: true },
+);
+CustomRoleSchema.index({ tenant: 1, name: 1 }, { unique: true });
+
+// API keys for tenant systems (Phase 3). Only a hash is stored; the key is shown once.
+const ApiKeySchema = new Schema(
+  {
+    tenant: { type: Types.ObjectId, ref: 'Tenant', required: true, index: true },
+    name: { type: String, required: true },
+    prefix: { type: String, required: true, index: true },
+    hash: { type: String, required: true },
+    scopes: [String],
+    expiresAt: Date,
+    revokedAt: Date,
+    lastUsedAt: Date,
+    lastUsedIp: String,
+    useCount: { type: Number, default: 0 },
+    createdBy: { type: Types.ObjectId, ref: 'User' },
+  },
+  { timestamps: true },
+);
+
+export const CustomRole = model('CustomRole', CustomRoleSchema);
+export const ApiKey = model('ApiKey', ApiKeySchema);

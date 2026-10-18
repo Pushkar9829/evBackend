@@ -2,7 +2,8 @@ import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
 import { User, Tenant } from '../models/index.js';
 import { unauthorized, forbidden, AppError } from '../lib/errors.js';
-import { ROLES, roleHas } from '../lib/permissions.js';
+import { roleDef, roleHas } from '../lib/permissions.js';
+import { ensureRole } from '../services/roles.js';
 import { getSettings } from '../services/settings.js';
 import { securityEvent } from '../services/audit.js';
 
@@ -28,6 +29,7 @@ export async function optionalAuth(req, _res, next) {
     req.user = user;
     req.auth = p;
     req.ctx = p.ctx || null;
+    if (p.kind === 'staff' && p.ctx?.role) await ensureRole(p.ctx.role);
     return next();
   } catch {
     return next();
@@ -58,7 +60,10 @@ export async function requireStaff(req, res, next) {
     }
     // Re-validate the role against the database on every request (role changes apply immediately).
     const { role, tenant } = req.ctx;
-    if (ROLES[role]?.scope === 'platform') {
+    const def = await ensureRole(role);
+    if (!def) return next(unauthorized('Your role no longer exists. Please log in again.'));
+    if (def.custom && def.tenant !== String(tenant)) return next(unauthorized());
+    if (def.scope === 'platform') {
       if (req.user.platformRole !== role) return next(unauthorized('Your role changed. Please log in again.'));
     } else {
       const m = req.user.membershipFor(tenant);
@@ -68,7 +73,8 @@ export async function requireStaff(req, res, next) {
       req.tenantDoc = t;
       req.ctx.siteIds = (m.siteIds || []).map(String);
     }
-    req.isPlatform = ROLES[role]?.scope === 'platform';
+    req.isPlatform = def.scope === 'platform';
+    req.roleDef = def;
     return next();
   });
 }
@@ -89,7 +95,7 @@ export const can = (...perms) => async (req, _res, next) => {
 export function scope(req, { siteField = 'site', tenantField = 'tenant' } = {}) {
   if (req.isPlatform) return req.query.tenant ? { [tenantField]: req.query.tenant } : {};
   const f = { [tenantField]: req.ctx.tenant };
-  if (ROLES[req.ctx.role]?.scope === 'site' && siteField) f[siteField] = { $in: req.ctx.siteIds };
+  if (roleDef(req.ctx.role)?.scope === 'site' && siteField) f[siteField] = { $in: req.ctx.siteIds };
   return f;
 }
 
@@ -106,7 +112,7 @@ export async function loadScoped(Model, id, req, { populate, tenantField = 'tena
       await securityEvent('cross_tenant_access', { user: String(req.user._id), tenant: req.ctx.tenant, target: String(id), model: Model.modelName }, req.ip);
       throw forbidden();
     }
-    if (ROLES[req.ctx.role]?.scope === 'site' && doc.site && !req.ctx.siteIds.includes(String(doc.site?._id || doc.site))) throw forbidden();
+    if (roleDef(req.ctx.role)?.scope === 'site' && doc.site && !req.ctx.siteIds.includes(String(doc.site?._id || doc.site))) throw forbidden();
   }
   return doc;
 }

@@ -1,6 +1,8 @@
 // Connection registry: which gateway node holds each charger's live socket.
 // Single-node build keeps it in memory; with several nodes this moves to Redis so commands route
 // to the right node (Requirements 3, "Several gateway servers").
+import { cluster } from './cluster.js';
+
 const connections = new Map();
 
 export const registry = {
@@ -18,6 +20,12 @@ export const registry = {
   },
   ids() {
     return [...connections.keys()];
+  },
+  /** Connected to this node, or (cluster mode) to another node. */
+  isConnected(ocppId) {
+    const c = connections.get(ocppId);
+    if (c && !c.closed) return true;
+    return !!cluster().remoteOwner(ocppId);
   },
 };
 

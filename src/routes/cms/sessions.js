@@ -5,7 +5,7 @@ import { parse, z } from '../../lib/validate.js';
 import { badRequest, forbidden, notFound } from '../../lib/errors.js';
 import { escapeRegex } from '../../lib/util.js';
 import { maskPhone } from '../../lib/logger.js';
-import { ROLES, roleHas } from '../../lib/permissions.js';
+import { roleDef, roleHas } from '../../lib/permissions.js';
 import { can, loadScoped, scope } from '../../middleware/auth.js';
 import { audit } from '../../services/audit.js';
 import { requestApproval, registerExecutor } from '../../services/approvals.js';
@@ -101,7 +101,7 @@ router.post('/sessions/:id/refund', can('session.refund'), async (req, res) => {
   if (!pay || pay.status !== 'captured') throw badRequest('NO_PAYMENT', 'There is no captured payment on this session.');
   const refundable = (pay.paidPaise ?? pay.amountPaise) - (pay.refundedPaise || 0);
   if (b.amountPaise > refundable) throw badRequest('REFUND_EXCEEDS_PAID', `A refund cannot exceed the amount paid. Refundable now: Rs ${(refundable / 100).toFixed(2)}.`);
-  const limit = ROLES[req.ctx.role]?.refundLimitPaise ?? Infinity;
+  const limit = roleDef(req.ctx.role)?.refundLimitPaise ?? Infinity;
   if (b.amountPaise > limit) {
     const a = await requestApproval(req, { type: 'refund', tenant: s.tenant, payload: { sessionId: String(s._id), amountPaise: b.amountPaise }, amountPaise: b.amountPaise, summary: `Refund Rs ${(b.amountPaise / 100).toFixed(2)} on session ${s._id}`, reason: b.reason });
     return res.status(202).json({ status: 'PendingApproval', approvalId: a._id });

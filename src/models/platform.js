@@ -19,6 +19,7 @@ const PlatformSettingsSchema = new Schema(
     defaultCommission: { kind: { type: String, default: 'percent' }, value: { type: Number, default: 1000 } },
     hostSuggestedPricePaisePerKwh: { type: Number, default: 1800 },
     ueiKeys: { publicKey: String, privateKey: String },
+    pki: { rootCert: String, rootKey: String, moCert: String, moKey: String },
   },
   { timestamps: true },
 );

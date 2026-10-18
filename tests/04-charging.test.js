@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { boot, shutdown, sim, guestSession, getSession, sessionDoc, waitFor, sleep } from './helpers.js';
 import { Alert, Charger, CommandLog, Refund, Session, Tariff } from '../src/models/index.js';
 import { tickSessions } from '../src/services/sessionEngine.js';
+import { energyRateAt } from '../src/services/tariffs.js';
 
 let api;
 before(async () => {
@@ -152,7 +153,7 @@ describe('2.6 during charging', () => {
     assert.equal(d.energyWh, before1.energyWh, 'billing uses the last valid reading');
     assert.ok(d.flags.includes('meter_rejected') && d.reviewNeeded);
     const v = await getSession(s.sessionId, s.accessToken);
-    const exp = Math.round((d.energyWh * d.tariff.energyPaisePerKwh) / 1000);
+    const exp = Math.round((d.energyWh * energyRateAt(d.tariff, new Date())) / 1000); // time-of-day band in force now
     assert.ok(Math.abs(v.liveCostPaise - Math.round(exp * 1.18)) <= 2, `live cost ${v.liveCostPaise} ~ ${exp} + GST`);
     await stop(s);
     await until(s.sessionId, 'BILLED');

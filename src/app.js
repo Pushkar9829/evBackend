@@ -16,6 +16,8 @@ import cmsChargers from './routes/cms/chargers.js';
 import cmsSessions from './routes/cms/sessions.js';
 import cmsOrg from './routes/cms/org.js';
 import adminRoutes from './routes/admin.js';
+import cmsAccess from './routes/cms/access.js';
+import v1Routes from './routes/v1.js';
 import ocpiRoutes from './roaming/ocpi/routes.js';
 import ueiRoutes from './roaming/uei/routes.js';
 import { registry } from './ocpp/registry.js';
@@ -52,7 +54,8 @@ export function createApp() {
   app.use('/api/public', publicRoutes);
   app.use('/api/sessions', sessionRoutes);
   app.use('/api/me', meRoutes);
-  app.use('/api/cms', requireStaff, cmsChargers, cmsSessions, cmsOrg);
+  app.use('/api/cms', requireStaff, cmsChargers, cmsSessions, cmsOrg, cmsAccess);
+  app.use('/api/v1', v1Routes);
   app.use('/api/admin', adminRoutes);
 
   app.use((_req, _res, next) => next(new AppError(404, 'NOT_FOUND', 'Not found.')));

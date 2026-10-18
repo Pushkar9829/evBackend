@@ -34,7 +34,12 @@ const ChargerSchema = new Schema(
     ocppId: { type: String, required: true, unique: true, trim: true },
     label: String,
     passwordHash: String,
-    protocol: { type: String, enum: ['ocpp2.0.1', 'ocpp1.6'], default: 'ocpp2.0.1' },
+    protocol: { type: String, enum: ['ocpp2.0.1', 'ocpp2.1', 'ocpp1.6'], default: 'ocpp2.0.1' },
+    // 2 = Basic auth over TLS; 3 = TLS with client certificate (password logins refused)
+    securityProfile: { type: Number, enum: [1, 2, 3], default: 2 },
+    certificate: { serial: String, notAfter: Date, fingerprint: String, issuedAt: Date },
+    installedCertificates: [{ certificateType: String, serial: String, at: Date, _id: false }],
+    v2gCapable: { type: Boolean, default: false },
     vendor: String,
     model: String,
     serial: String,

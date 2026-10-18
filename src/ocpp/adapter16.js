@@ -13,6 +13,8 @@ const STATUS_16_TO_201 = {
   Unavailable: 'Unavailable',
   Faulted: 'Faulted',
 };
+// 2.0.1 authorization statuses that 1.6J does not know
+const STATUS16 = { Accepted: 'Accepted', Blocked: 'Blocked', Expired: 'Expired', Invalid: 'Invalid', ConcurrentTx: 'ConcurrentTx', NoCredit: 'Invalid', NotAllowedTypeEVSE: 'Invalid', NotAtThisLocation: 'Invalid', NotAtThisTime: 'Invalid', Unknown: 'Invalid' };
 const CHARGING_STATE = { Charging: 'Charging', SuspendedEV: 'SuspendedEV', SuspendedEVSE: 'SuspendedEVSE', Preparing: 'EVConnected', Finishing: 'EVConnected' };
 
 const toWhSampled = (sv) => ({
@@ -47,7 +49,7 @@ export async function inbound16(conn, action, p) {
       };
     }
     case 'Authorize':
-      return { action, payload: { idToken: { idToken: p.idTag, type: 'ISO14443' } }, respond: (r) => ({ idTagInfo: { status: r.idTokenInfo?.status || 'Invalid' } }) };
+      return { action, payload: { idToken: { idToken: p.idTag, type: 'ISO14443' } }, respond: (r) => ({ idTagInfo: { status: STATUS16[r.idTokenInfo?.status] || 'Invalid' } }) };
     case 'StartTransaction': {
       // 1.6: the CSMS assigns the integer transaction id.
       const txId = await nextSeq('ocpp16:tx');
@@ -110,6 +112,11 @@ export async function inbound16(conn, action, p) {
       return { action, payload: { status: p.status }, respond: () => ({}) };
     case 'DataTransfer':
       return { action, payload: p, respond: (r) => r };
+    // "Improved security for OCPP 1.6-J": same message names and shapes as 2.0.1
+    case 'SignCertificate':
+      return { action, payload: { csr: p.csr, certificateType: 'ChargingStationCertificate' }, respond: (r) => ({ status: r.status }) };
+    case 'SecurityEventNotification':
+      return { action, payload: p, respond: () => ({}) };
     default:
       return null;
   }
@@ -144,6 +151,9 @@ export function outbound16(conn, action, p) {
       return { action: 'ChangeConfiguration', payload: { key: d.variable.name, value: String(d.attributeValue) }, mapResponse: (r) => ({ setVariableResult: [{ attributeStatus: r.status === 'NotSupported' ? 'UnknownVariable' : r.status, component: d.component, variable: d.variable }] }) };
     }
     case 'TriggerMessage':
+      if (p.requestedMessage === 'SignChargingStationCertificate') {
+        return { action: 'ExtendedTriggerMessage', payload: { requestedMessage: 'SignChargePointCertificate' }, mapResponse: (r) => ({ status: r.status }) };
+      }
       return {
         action: 'TriggerMessage',
         payload: { requestedMessage: p.requestedMessage === 'TransactionEvent' ? 'MeterValues' : p.requestedMessage, connectorId: p.evse?.id },
@@ -185,6 +195,10 @@ export function outbound16(conn, action, p) {
     }
     case 'DataTransfer':
       return { action, payload: p, mapResponse: (r) => r };
+    case 'CertificateSigned':
+      return { action, payload: { certificateChain: p.certificateChain }, mapResponse: (r) => ({ status: r.status }) };
+    case 'InstallCertificate':
+      return { action, payload: { certificateType: p.certificateType === 'CSMSRootCertificate' ? 'CentralSystemRootCertificate' : p.certificateType, certificate: p.certificate }, mapResponse: (r) => ({ status: r.status }) };
     default:
       return { action, payload: p, mapResponse: (r) => r };
   }

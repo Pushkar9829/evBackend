@@ -34,6 +34,7 @@ export function snapshot(tariff, tenant) {
     memberDiscountBps: o.memberDiscountBps || 0,
     fleetDiscountBps: o.fleetDiscountBps || 0,
     roamingEnergyPaisePerKwh: o.roamingEnergyPaisePerKwh,
+    v2gExportPaisePerKwh: o.v2gExportPaisePerKwh || 0,
     pricesIncludeGst: !!tenant?.pricesIncludeGst,
     gstRateBps: config.gstRateBps,
   };
@@ -63,7 +64,7 @@ export function computeBill(session, { at = new Date(), capPaise } = {}) {
   const inclusive = !!t.pricesIncludeGst;
   const energyWh = session.energyWh || 0;
   const lines = [];
-  if (energyWh <= 0) {
+  if (energyWh <= 0 && !(session.exportedWh > 0)) {
     return { lines, energyPaise: 0, sessionFeePaise: 0, timePaise: 0, idlePaise: 0, discountPaise: 0, taxablePaise: 0, gstPaise: 0, totalPaise: 0, absorbedPaise: 0 };
   }
 
@@ -105,6 +106,12 @@ export function computeBill(session, { at = new Date(), capPaise } = {}) {
   let discount = roundPaise((subtotal * discountBps) / 10000) + promoDiscount;
   discount = Math.min(discount, subtotal);
   if (discount) lines.push({ code: 'discount', description: 'Discount', quantity: 1, unit: 'session', ratePaise: -discount, amount: -discount });
+
+  // V2G (OCPP 2.1): credit for energy returned to the grid, never more than the charges [Confirm payouts]
+  if (t.v2gExportPaisePerKwh && session.exportedWh > 0) {
+    const credit = Math.min(roundPaise((session.exportedWh * t.v2gExportPaisePerKwh) / 1000), lines.reduce((s, l) => s + l.amount, 0));
+    if (credit > 0) lines.push({ code: 'v2g_credit', description: `Energy returned to grid ${(session.exportedWh / 1000).toFixed(3)} kWh`, quantity: session.exportedWh / 1000, unit: 'kWh', ratePaise: -t.v2gExportPaisePerKwh, amount: -credit });
+  }
 
   // GST per line
   let out = lines.map((l) => {

@@ -10,8 +10,12 @@ import { VirtualCharger } from '../ocpp/simulator.js';
 
 const sims = new Map();
 let localPort = config.port;
+let tls = null; // { port, ca } when the mutual-TLS listener runs
 export const setSimulatorPort = (p) => {
   localPort = p;
+};
+export const setSimulatorTls = (port, ca) => {
+  tls = port ? { port, ca } : null;
 };
 
 export const getSim = (ocppId) => sims.get(ocppId);
@@ -38,6 +42,8 @@ export async function startSim(chargerId, { meterIntervalSec = 5, speed = 60 } =
     connectors: charger.connectors.map((c) => ({ number: c.number, maxPowerKw: c.maxPowerKw })),
     meterIntervalSec,
     speed,
+    tlsUrl: tls ? `wss://localhost:${tls.port}/ocpp` : undefined,
+    ca: tls?.ca,
   });
   sim.password = password;
   sim.protocol = charger.protocol;
@@ -81,6 +87,20 @@ export async function simAction(ocppId, action, args = {}) {
     case 'reorder_next': sim.faults.reorderNext = true; break;
     case 'set_soc': sim.conn(n).soc = Number(args.soc ?? 30); break;
     case 'rfid': return { status: await sim.swipeRfid(n, String(args.uid)) };
+    case 'pnc_plug': {
+      // A car with an ISO 15118 contract plugs in: hash data comes from the certificate we issued.
+      const { IssuedCertificate } = await import('./pki.js');
+      const cert = await IssuedCertificate.findOne({ kind: 'ContractCertificate', emaid: String(args.emaid) }).lean();
+      const hashData = cert ? { hashAlgorithm: 'SHA256', issuerNameHash: cert.issuerNameHash, issuerKeyHash: cert.issuerKeyHash, serialNumber: cert.serial } : undefined;
+      return sim.plugInPnc(n, { emaid: String(args.emaid), hashData });
+    }
+    case 'request_certificate': await sim.requestCertificate(); break;
+    case 'reconnect_tls':
+      if (!sim.tlsUrl) throw badRequest('NO_TLS', 'Start the server with OCPP_TLS_PORT to use Security Profile 3.');
+      sim.useTls = true;
+      await sim.disconnect({ keepWanting: true });
+      await sim.connect();
+      break;
     case 'fault_flags':
       for (const k of ['rejectStart', 'neverStart', 'rejectStop', 'unlockFails', 'ignoreCalls']) if (k in args) sim.faults[k] = !!args[k];
       if ('delayMs' in args) sim.faults.delayMs = Number(args.delayMs) || 0;

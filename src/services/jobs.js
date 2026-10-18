@@ -11,13 +11,14 @@ import { registry } from '../ocpp/registry.js';
 import { markOffline } from '../ocpp/brain.js';
 import { sendCommand } from '../ocpp/commands.js';
 import { pushPendingCdrs } from '../roaming/ocpi/client.js';
+import { cluster } from '../ocpp/cluster.js';
 
 const timers = [];
 const running = new Set();
 
 function every(name, ms, fn) {
   const run = async () => {
-    if (running.has(name)) return;
+    if (running.has(name) || !cluster().isLeader()) return; // with several nodes only the leader runs jobs
     running.add(name);
     try {
       await fn();
@@ -36,6 +37,7 @@ export async function sweepOffline() {
   const online = await Charger.find({ online: true }).select('ocppId tenant lastSeen');
   for (const c of online) {
     const conn = registry.get(c.ocppId);
+    if ((!conn || conn.closed) && cluster().remoteOwner(c.ocppId) && c.lastSeen >= limit) continue; // held by another node
     if (!conn || conn.closed || c.lastSeen < limit) {
       if (conn && !conn.closed) conn.close(4001, 'heartbeat timeout');
       else await markOffline(c);

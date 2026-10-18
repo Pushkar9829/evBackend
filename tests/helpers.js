@@ -13,13 +13,13 @@ export { DEMO };
 let ctx = null;
 
 /** One server + freshly seeded test DB per test file. */
-export async function boot() {
+export async function boot({ tls = false } = {}) {
   if (ctx) return ctx;
-  const { server, port } = await startServer({ port: 0, jobs: false });
+  const { server, port, tlsServer, tlsPort } = await startServer({ port: 0, jobs: false, tlsPort: tls ? 0 : undefined });
   await seed({ reset: true, quiet: true });
   invalidateSettings();
   const api = request(server);
-  ctx = { server, port, api, sims: [] };
+  ctx = { server, port, api, sims: [], tlsServer, tlsPort };
   return ctx;
 }
 
@@ -29,6 +29,10 @@ export async function shutdown() {
   await stopAllSims();
   stopJobs();
   await sleep(800); // let in-flight handlers finish
+  if (ctx.tlsServer) {
+    ctx.tlsServer.closeAllConnections?.();
+    await new Promise((r) => ctx.tlsServer.close(r));
+  }
   await new Promise((r) => ctx.server.close(r));
   ctx.server.closeAllConnections?.();
   await mongoose.disconnect();

@@ -1,4 +1,6 @@
-import { Notification, NotificationTemplate, User } from '../models/index.js';
+import { Invoice, Notification, NotificationTemplate, Session, User } from '../models/index.js';
+import { sendEmail, sendPush, sendSms, sendWhatsapp } from './providers.js';
+import { invoicePdfBuffer } from './invoices.js';
 import { config } from '../config.js';
 import { logger, maskPhone } from '../lib/logger.js';
 
@@ -41,13 +43,30 @@ async function template(key, channel, lang) {
   return t;
 }
 
-async function deliver(channel, to, body) {
-  // Real providers (MSG91 DLT SMS/WhatsApp, FCM, SES) plug in here; mock logs instead.
-  if (config.sms.provider === 'mock' || channel === 'push' || channel === 'email' || channel === 'inapp') {
-    logger.info(`[notify:${channel}] -> ${channel === 'sms' || channel === 'whatsapp' ? maskPhone(to) : to}: ${body}`);
-    return true;
+const TITLES = { session_started: 'Charging started', session_completed: 'Charging complete', refund_initiated: 'Refund on its way', session_failed: "Charging didn't start", amount_80: '80% of your amount used', charger_offline: 'Charger connection lost', zero_power: 'Car not taking power' };
+
+async function deliver(channel, { u, to, body, tpl, vars, eventKey, lang, session }) {
+  if (channel === 'inapp') return;
+  if (channel === 'sms') return sendSms(to, { body, templateId: tpl?.dltTemplateId, vars });
+  if (channel === 'whatsapp') return sendWhatsapp(to, { body, templateName: tpl?.dltTemplateId || eventKey, lang, vars });
+  if (channel === 'push') {
+    const r = await sendPush(u.pushTokens || [], { title: TITLES[eventKey] || 'ChargeX', body, data: { event: eventKey, session: session ? String(session) : '' } });
+    if (r.invalidTokens.length) {
+      await User.updateOne({ _id: u._id }, { $set: { 'pushTokens.$[t].valid': false } }, { arrayFilters: [{ 't.token': { $in: r.invalidTokens } }] });
+    }
+    if (!r.sent) throw new Error('No valid push token');
+    return r;
   }
-  throw new Error(`Provider ${config.sms.provider} not configured`);
+  if (channel === 'email') {
+    const attachments = [];
+    if (eventKey === 'session_completed' && session) {
+      const s = await Session.findById(session).select('invoice').lean();
+      const inv = s?.invoice && (await Invoice.findById(s.invoice));
+      if (inv?.status === 'issued') attachments.push({ filename: `${inv.number.replace(/\//g, '-')}.pdf`, content: await invoicePdfBuffer(inv) });
+    }
+    return sendEmail(u.email, { subject: TITLES[eventKey] || 'ChargeX', text: body, attachments });
+  }
+  throw new Error(`Unknown channel ${channel}`);
 }
 
 /**
@@ -72,10 +91,14 @@ export async function notify(eventKey, { user, phone, session, vars = {}, eventA
   if (u) channels.push('inapp');
   if (!u && to && !channels.includes('sms') && CRITICAL.has(eventKey)) channels.push('sms');
 
+  // Extra channels the driver opted into
+  if (u?.notificationPrefs?.whatsapp && to && CRITICAL.has(eventKey) && !channels.includes('whatsapp')) channels.push('whatsapp');
+  if (u?.email && u?.notificationPrefs?.email && ['session_completed', 'refund_initiated', 'refund_delayed'].includes(eventKey)) channels.push('email');
+
   const results = [];
   for (const channel of channels) {
     const dedupeKey = session ? `${session}:${eventKey}:${channel}` : undefined;
-    const tpl = channel === 'inapp' ? null : await template(eventKey, channel === 'push' ? 'push' : channel, lang);
+    const tpl = channel === 'inapp' ? null : await template(eventKey, channel, lang);
     // DLT rule: SMS can only go out on an approved, registered template (NOT-02).
     if (channel === 'sms' && config.sms.provider !== 'mock' && !(tpl?.approved && tpl?.dltTemplateId)) {
       results.push(await safeLog({ user: u?._id, phone: to, session, channel, template: eventKey, lang, eventAt, status: 'blocked', error: 'Template not DLT-approved', dedupeKey }));
@@ -83,10 +106,12 @@ export async function notify(eventKey, { user, phone, session, vars = {}, eventA
     }
     const body = render(tpl?.body || FALLBACK_TEXT[lang]?.[eventKey] || FALLBACK_TEXT.en[eventKey] || eventKey, vars);
     try {
-      await deliver(channel, channel === 'push' ? `user:${u?._id}` : to, body);
+      await deliver(channel, { u, to, body, tpl, vars, eventKey, lang, session });
       results.push(await safeLog({ user: u?._id, phone: to, session, channel, template: eventKey, lang, body, eventAt, status: 'sent', dedupeKey }));
     } catch (e) {
       results.push(await safeLog({ user: u?._id, phone: to, session, channel, template: eventKey, lang, body, eventAt, status: 'failed', error: e.message, dedupeKey }));
+      // Push failed (dead tokens): critical events fall back to SMS (NOT-01)
+      if (channel === 'push' && CRITICAL.has(eventKey) && to && !channels.includes('sms')) channels.push('sms');
     }
   }
   return results;
@@ -101,8 +126,15 @@ async function safeLog(doc) {
   }
 }
 
-/** Plain SMS (OTP) — goes through the same delivery/mock path. */
-export async function sendOtpSms(phone, code, lang = 'en') {
+/** OTP by SMS (default), WhatsApp or voice fallback (ACC-05). */
+export async function sendOtpSms(phone, code, lang = 'en', channel = 'sms') {
   const body = render(FALLBACK_TEXT[lang]?.otp || FALLBACK_TEXT.en.otp, { code });
-  await deliver('sms', phone, body);
+  const tpl = await template('otp', channel === 'voice' ? 'sms' : channel, lang);
+  if (channel === 'whatsapp') return sendWhatsapp(phone, { body, templateName: tpl?.dltTemplateId || 'otp', lang, vars: { code } });
+  if (channel === 'voice') {
+    // MSG91 voice OTP needs a separate product; logged until configured.
+    logger.info(`[otp voice] -> ${maskPhone(phone)} (configure a voice provider)`);
+    return { mock: true };
+  }
+  return sendSms(phone, { body, templateId: tpl?.dltTemplateId, vars: { code } });
 }

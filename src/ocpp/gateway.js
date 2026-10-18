@@ -8,10 +8,12 @@ import { raiseAlert } from '../services/alerts.js';
 import { securityEvent } from '../services/audit.js';
 import { ChargerConnection } from './connection.js';
 import { registry } from './registry.js';
+import { cluster } from './cluster.js';
 import { handleCall, markOffline, markOnline } from './brain.js';
 import { onChargerOffline, onChargerOnline } from '../services/sessionEngine.js';
+import { peerIdentity } from '../services/pki.js';
 
-const SUPPORTED = ['ocpp2.0.1', 'ocpp1.6'];
+const SUPPORTED = ['ocpp2.1', 'ocpp2.0.1', 'ocpp1.6'];
 
 function reject(socket, code, text) {
   socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
@@ -47,8 +49,16 @@ export function attachOcppGateway(server) {
         await securityEvent('ocpp_unknown_charger', { ocppId }, ip);
         return reject(socket, 404, 'Not Found');
       }
-      const cred = parseBasic(req.headers.authorization);
-      const ok = cred && cred.user === ocppId && charger.passwordHash && (await bcrypt.compare(cred.pass, charger.passwordHash));
+      // Security Profile 3: TLS client certificate issued by our CA with CN = charger id.
+      const peer = req.socket.encrypted ? peerIdentity(req.socket) : null;
+      const certOk = !!(peer?.authorized && peer.cn === ocppId && (!charger.certificate?.fingerprint || charger.certificate.fingerprint === peer.fingerprint));
+      if (peer && peer.cn && !certOk) await securityEvent('ocpp_bad_client_cert', { ocppId, cn: peer.cn, authorized: peer.authorized, tenant: String(charger.tenant) }, ip);
+      if (charger.securityProfile === 3 && !certOk) {
+        await securityEvent('ocpp_profile3_required', { ocppId, tenant: String(charger.tenant) }, ip);
+        return reject(socket, 401, 'Unauthorized');
+      }
+      const cred = certOk ? null : parseBasic(req.headers.authorization);
+      const ok = certOk || (cred && cred.user === ocppId && charger.passwordHash && (await bcrypt.compare(cred.pass, charger.passwordHash)));
       if (!ok) {
         // Wrong password: rejected; repeated failures alert ops (SEC-02 / SEC-03)
         const fails = (charger.authFailures || 0) + 1;
@@ -60,6 +70,7 @@ export function attachOcppGateway(server) {
       const offered = (req.headers['sec-websocket-protocol'] || '').split(',').map((s) => s.trim());
       if (!offered.some((p) => SUPPORTED.includes(p))) return reject(socket, 400, 'Unsupported Subprotocol');
       req.chargerProtocol = charger.protocol;
+      req.authMethod = certOk ? 'certificate' : 'password';
       wss.handleUpgrade(req, socket, head, (ws) => {
         const protocol = ws.protocol || charger.protocol;
         const existing = registry.get(ocppId);
@@ -73,6 +84,8 @@ export function attachOcppGateway(server) {
             if (registry.get(ocppId) !== c) return; // replaced by a newer connection
             registry.delete(ocppId, c);
             logger.info(`charger ${ocppId} disconnected`);
+            await cluster().announce(ocppId, false).catch(() => {});
+            if (c.replaced) return; // moved to another node; that node keeps it online
             await markOffline(charger);
             await onChargerOffline(charger);
           },
@@ -88,12 +101,13 @@ export function attachOcppGateway(server) {
           if (ws.readyState === 1) ws.ping();
           else clearInterval(conn.pingTimer);
         }, 30000);
-        logger.info(`charger ${ocppId} connected (${protocol})`);
+        logger.info(`charger ${ocppId} connected (${protocol}, ${req.authMethod})`);
         (async () => {
           if (existing && !existing.closed) await raiseAlert({ tenant: charger.tenant, type: 'security', severity: 'warning', charger: charger._id, message: `Duplicate connection for ${ocppId}; previous connection closed`, dedupeKey: `dup:${ocppId}` });
           const set = { authFailures: 0 };
           if (protocol !== charger.protocol) set.protocol = protocol;
           await Charger.updateOne({ _id: charger._id }, { $set: set });
+          await cluster().announce(ocppId, true).catch((e) => logger.warn(`cluster announce: ${e.message}`));
           await markOnline(charger);
           await onChargerOnline(charger);
         })().catch((e) => logger.error('ocpp connect bookkeeping', e));
