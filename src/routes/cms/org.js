@@ -5,7 +5,7 @@ import { Adjustment, Alert, Approval, AuditLog, Cdr, Charger, Complaint, Payout,
 import { parse, phoneSchema, z } from '../../lib/validate.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/errors.js';
 import { TENANT_ROLES, roleDef } from '../../lib/permissions.js';
-import { can, loadScoped, scope, writeTenant } from '../../middleware/auth.js';
+import { can, loadScoped, scope, scopeMatch, writeTenant } from '../../middleware/auth.js';
 import { audit } from '../../services/audit.js';
 import { decideApproval } from '../../services/approvals.js';
 import { assertAssignable, roleOptions } from './access.js';
@@ -38,16 +38,29 @@ router.get('/site-host/summary', can('site.revenue_share'), async (req, res) => 
 router.get('/dashboard', async (req, res) => {
   const f = scope(req);
   const chargerF = { ...f, deletedAt: null };
-  const [chargers, active, todays, openComplaints, openAlerts, review] = await Promise.all([
+  const [chargers, active, todays, openComplaints, openAlerts, review, daily] = await Promise.all([
     Charger.find(chargerF).select('ocppId label online connectors site inService').populate('site', 'name location').lean(),
     Session.countDocuments({ ...f, state: { $in: ['STARTING', 'CHARGING', 'STOPPING', 'INTERRUPTED'] } }),
     Session.find({ ...f, state: 'BILLED', endedAt: { $gte: today() } }).select('energyWh costs.totalPaise').lean(),
     Complaint.countDocuments({ ...scope(req, { siteField: null }), status: { $in: ['open', 'in_progress'] } }),
     Alert.countDocuments({ ...scope(req, { siteField: null }), status: 'open' }),
     Session.countDocuments({ ...f, reviewNeeded: true }),
+    // Last 14 days (IST calendar days) for the KPI sparklines and trend chart
+    Session.aggregate([
+      { $match: { ...scopeMatch(req), state: 'BILLED', endedAt: { $gte: sinceDays(15) } } },
+      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$endedAt', timezone: 'Asia/Kolkata' } }, sessions: { $sum: 1 }, energyWh: { $sum: '$energyWh' }, revenuePaise: { $sum: '$costs.totalPaise' } } },
+    ]),
   ]);
   const faulted = chargers.filter((c) => c.connectors.some((x) => x.status === 'Faulted')).length;
+  const istDay = (d) => new Date(d.getTime() + 330 * 60_000).toISOString().slice(0, 10);
+  const series = Array.from({ length: 14 }, (_, i) => {
+    const day = istDay(new Date(Date.now() - (13 - i) * 86400_000));
+    const r = daily.find((x) => x._id === day);
+    return { day, sessions: r?.sessions || 0, energyWh: r?.energyWh || 0, revenuePaise: r?.revenuePaise || 0 };
+  });
   res.json({
+    series,
+    yesterday: series[12],
     chargers: { total: chargers.length, online: chargers.filter((c) => c.online).length, offline: chargers.filter((c) => !c.online).length, faulted },
     activeSessions: active,
     today: { sessions: todays.length, energyWh: todays.reduce((s, x) => s + (x.energyWh || 0), 0), revenuePaise: todays.reduce((s, x) => s + (x.costs?.totalPaise || 0), 0) },
@@ -122,20 +135,20 @@ router.post('/tariffs/:id/new-version', can('tariff.manage'), async (req, res) =
 
 router.get('/finance/summary', can('finance.view'), async (req, res) => {
   const days = Number(req.query.days || 30);
-  const f = { ...scope(req), state: 'BILLED', endedAt: { $gte: sinceDays(days) } };
+  const f = { ...scopeMatch(req), state: 'BILLED', endedAt: { $gte: sinceDays(days) } };
   const rows = await Session.aggregate([
     { $match: f },
     { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$endedAt', timezone: '+05:30' } }, sessions: { $sum: 1 }, energyWh: { $sum: '$energyWh' }, revenuePaise: { $sum: '$costs.totalPaise' }, gstPaise: { $sum: '$costs.gstPaise' }, taxablePaise: { $sum: '$costs.taxablePaise' }, commissionPaise: { $sum: '$commissionPaise' }, tenantSharePaise: { $sum: '$tenantSharePaise' } } },
     { $sort: { _id: 1 } },
   ]);
   const total = rows.reduce((a, r) => ({ sessions: a.sessions + r.sessions, energyWh: a.energyWh + r.energyWh, revenuePaise: a.revenuePaise + r.revenuePaise, gstPaise: a.gstPaise + r.gstPaise, commissionPaise: a.commissionPaise + r.commissionPaise, tenantSharePaise: a.tenantSharePaise + r.tenantSharePaise }), { sessions: 0, energyWh: 0, revenuePaise: 0, gstPaise: 0, commissionPaise: 0, tenantSharePaise: 0 });
-  const refunds = await Refund.aggregate([{ $match: { ...scope(req, { siteField: null }), createdAt: { $gte: sinceDays(days) } } }, { $group: { _id: '$status', n: { $sum: 1 }, amountPaise: { $sum: '$amountPaise' } } }]);
+  const refunds = await Refund.aggregate([{ $match: { ...scopeMatch(req, { siteField: null }), createdAt: { $gte: sinceDays(days) } } }, { $group: { _id: '$status', n: { $sum: 1 }, amountPaise: { $sum: '$amountPaise' } } }]);
   res.json({ days: rows, total, refunds });
 });
 
 router.get('/finance/gst', can('finance.view'), async (req, res) => {
   const rows = await Session.aggregate([
-    { $match: { ...scope(req), state: 'BILLED', 'costs.totalPaise': { $gt: 0 } } },
+    { $match: { ...scopeMatch(req), state: 'BILLED', 'costs.totalPaise': { $gt: 0 } } },
     { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$endedAt', timezone: '+05:30' } }, taxablePaise: { $sum: '$costs.taxablePaise' }, gstPaise: { $sum: '$costs.gstPaise' }, totalPaise: { $sum: '$costs.totalPaise' }, invoices: { $sum: 1 } } },
     { $sort: { _id: -1 } },
   ]);
@@ -174,7 +187,7 @@ router.get('/reports/chargers', can('report.view'), async (req, res) => {
   const days = Number(req.query.days || 30);
   const chargers = await Charger.find({ ...scope(req), deletedAt: null }).populate('site', 'name').lean();
   const stats = await Session.aggregate([
-    { $match: { ...scope(req), createdAt: { $gte: sinceDays(days) } } },
+    { $match: { ...scopeMatch(req), createdAt: { $gte: sinceDays(days) } } },
     { $group: { _id: { charger: '$charger', state: '$state' }, n: { $sum: 1 }, energyWh: { $sum: '$energyWh' }, revenuePaise: { $sum: '$costs.totalPaise' }, chargingMs: { $sum: { $cond: [{ $and: ['$startedAt', '$endedAt'] }, { $subtract: ['$endedAt', '$startedAt'] }, 0] } } } },
   ]);
   const rows = chargers.map((c) => {
@@ -193,7 +206,7 @@ router.get('/reports/chargers', can('report.view'), async (req, res) => {
 
 router.get('/reports/failures', can('report.view'), async (req, res) => {
   const rows = await Session.aggregate([
-    { $match: { ...scope(req), state: { $in: ['FAILED', 'CANCELLED'] }, createdAt: { $gte: sinceDays(Number(req.query.days || 30)) } } },
+    { $match: { ...scopeMatch(req), state: { $in: ['FAILED', 'CANCELLED'] }, createdAt: { $gte: sinceDays(Number(req.query.days || 30)) } } },
     { $group: { _id: '$failureReason', n: { $sum: 1 } } },
     { $sort: { n: -1 } },
   ]);

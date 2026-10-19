@@ -8,7 +8,7 @@ import { attachOcppGateway } from './ocpp/gateway.js';
 import { startJobs, stopJobs } from './services/jobs.js';
 import { attachRoamingListeners } from './roaming/ocpi/client.js';
 import { attachUeiListeners } from './roaming/uei/routes.js';
-import { setSimulatorPort, setSimulatorTls, stopAllSims } from './services/simulators.js';
+import { resumeSims, setSimulatorPort, setSimulatorTls, stopAllSims } from './services/simulators.js';
 import { Charger } from './models/index.js';
 import { logger } from './lib/logger.js';
 import { createCluster, redisFactory, setCluster, cluster } from './ocpp/cluster.js';
@@ -46,6 +46,8 @@ export async function startServer({ port = config.port, jobs = true, tlsPort = p
   const actual = server.address().port;
   setSimulatorPort(actual);
   if (jobs) startJobs();
+  // Dev: `node --watch` restarts drop the in-process simulators; bring back the ones that were simulated.
+  if ((process.env.SIM_AUTOSTART ?? (config.env === 'development' ? '1' : '0')) === '1') resumeSims().catch((e) => logger.warn('simulator autostart failed', e));
   logger.info(`ChargeX API on :${actual} (OCPP ws://localhost:${actual}/ocpp/<id>)`);
 
   // Optional mutual-TLS listener for OCPP Security Profile 3 (self-hosted / TCP pass-through load balancer).

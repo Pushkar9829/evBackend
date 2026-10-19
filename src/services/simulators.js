@@ -53,6 +53,13 @@ export async function startSim(chargerId, { meterIntervalSec = 5, speed = 60 } =
   return sim;
 }
 
+/** Restart every charger marked as simulated (used at dev startup). */
+export async function resumeSims() {
+  const chargers = await Charger.find({ isSimulated: true, deletedAt: null }).select('_id').lean();
+  for (const c of chargers) await startSim(c._id).catch(() => {});
+  return chargers.length;
+}
+
 export async function stopSim(ocppId) {
   const sim = sims.get(ocppId);
   if (!sim) return;

@@ -30,3 +30,9 @@ export async function flagOn(flag, tenantOrId) {
   const s = await getSettings();
   return !!s.featureFlags?.get?.(flag);
 }
+
+/** Operator branding for driver pages, only for tenants with the paid white_label flag. */
+export async function tenantBranding(t) {
+  if (!t?.branding?.primaryColor || !(await flagOn('white_label', t))) return undefined;
+  return { slug: t.slug, name: t.branding.appName || t.name, logoUrl: t.branding.logoUrl, primaryColor: t.branding.primaryColor, accentColor: t.branding.accentColor };
+}

@@ -125,3 +125,27 @@ describe('operations', () => {
     assert.equal(view.body.messageKey, 'complete');
   });
 });
+
+describe('tenant aggregates and session branding', () => {
+  // Regression: aggregate $match got string tenant ids from scope(), so tenant staff saw empty numbers.
+  it('tenant finance, customers and the dashboard trend include the tenant own billed sessions', async () => {
+    const owner = await staffToken('owner@voltgrid.in');
+    const vg = await Tenant.findOne({ slug: 'voltgrid' }).lean();
+    const billed = await Session.countDocuments({ tenant: vg._id, state: 'BILLED' });
+    assert.ok(billed > 0, 'earlier tests billed VoltGrid sessions');
+    const fin = await api.get('/api/cms/finance/summary?days=30').set(auth(owner)).expect(200);
+    assert.ok(fin.body.days.length > 0, 'finance days');
+    assert.equal(fin.body.days.reduce((a, d) => a + d.sessions, 0), billed);
+    const cust = await api.get('/api/cms/customers').set(auth(owner)).expect(200);
+    assert.ok(cust.body.customers.length > 0, 'customers');
+    const dash = await api.get('/api/cms/dashboard').set(auth(owner)).expect(200);
+    assert.equal(dash.body.series.length, 14);
+    assert.equal(dash.body.series.reduce((a, d) => a + d.sessions, 0), billed);
+  });
+
+  it('the live session view carries the white-label brand of the operator', async () => {
+    const doc = await Session.findOne({ state: 'BILLED', guestPhone: { $ne: null } }).lean();
+    const view = await api.get(`/api/cms/sessions/${doc._id}/as-driver`).set(auth(await staffToken('owner@voltgrid.in'))).expect(200);
+    assert.equal(view.body.branding?.name, 'VoltGo');
+  });
+});

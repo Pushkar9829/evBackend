@@ -3,7 +3,7 @@ import { Charger, Content, PartnerLocation, Site, Tenant } from '../models/index
 import { config } from '../config.js';
 import { AppError } from '../lib/errors.js';
 import { escapeRegex } from '../lib/util.js';
-import { flagOn, getSettings } from '../services/settings.js';
+import { flagOn, getSettings, tenantBranding } from '../services/settings.js';
 import { activeTariff, currentPrice, estimateForAmount } from '../services/tariffs.js';
 import { isOnline } from '../ocpp/commands.js';
 import { optionalAuth } from '../middleware/auth.js';
@@ -78,7 +78,7 @@ export async function publicCharger(ch, { site, tenant, origin } = {}) {
     photos: ch.photos,
     roaming: ch.roamingEnabled,
     // QR pages of white-label operators are shown in the operator's brand
-    branding: t?.branding?.primaryColor && (await flagOn('white_label', t)) ? { slug: t.slug, name: t.branding.appName || t.name, logoUrl: t.branding.logoUrl, primaryColor: t.branding.primaryColor, accentColor: t.branding.accentColor } : undefined,
+    branding: await tenantBranding(t),
   };
 }
 

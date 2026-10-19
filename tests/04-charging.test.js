@@ -82,11 +82,13 @@ describe('2.5 starting a session', () => {
 
   it('STA-07 faulted connector is blocked before payment', async () => {
     await c.setFault(2, true);
-    await sleep(200);
+    // Wait for the StatusNotification to land instead of a fixed sleep (flaky under load)
+    await waitFor(async () => (await Charger.findOne({ ocppId: 'VG-PUN-001' }).lean()).connectors.find((x) => x.number === 2).status === 'Faulted', { label: 'connector faulted' });
     const r = await api.post('/api/sessions').send({ ocppId: 'VG-PUN-001', connector: 2, amountPaise: 20000, phone: '9123400001' });
     assert.equal(r.status, 409);
     assert.equal(r.body.error.code, 'CONNECTOR_UNAVAILABLE');
     await c.setFault(2, false);
+    await waitFor(async () => (await Charger.findOne({ ocppId: 'VG-PUN-001' }).lean()).connectors.find((x) => x.number === 2).status !== 'Faulted', { label: 'fault cleared' });
   });
 
   it('STA-08 car not accepting charge: no energy for the limit -> stop + full refund', async () => {

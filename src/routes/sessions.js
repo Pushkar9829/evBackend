@@ -12,7 +12,7 @@ import { provider } from '../services/payments/index.js';
 import { requestOtp, verifyOtp } from '../services/otp.js';
 import { invoicePdf } from '../services/invoices.js';
 import { sendCommand } from '../ocpp/commands.js';
-import { getSettings } from '../services/settings.js';
+import { getSettings, tenantBranding } from '../services/settings.js';
 import { events } from '../services/events.js';
 import { roleHas } from '../lib/permissions.js';
 
@@ -86,6 +86,7 @@ export async function sessionView(s, access) {
   } else if (s.state === 'BILLED' && s.stopReason === 'limit') say('limit_used', `Your ${amt} has been used: ${messageVars.kwh} kWh added. Please unplug your vehicle.`);
   else if (s.state === 'BILLED') say('complete', 'Charging complete. Please unplug and free the spot.');
   const inv = s.invoice ? await Invoice.findById(s.invoice).select('number status totalPaise').lean() : null;
+  const branding = await tenantBranding(await Tenant.findById(s.tenant).select('name slug branding featureFlags').lean());
   return {
     id: s._id,
     state: s.state,
@@ -122,6 +123,7 @@ export async function sessionView(s, access) {
     flags: access === 'staff' ? s.flags : undefined,
     rating: s.rating,
     supportPhone: settings.supportPhone,
+    branding,
   };
 }
 

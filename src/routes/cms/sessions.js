@@ -6,7 +6,7 @@ import { badRequest, forbidden, notFound } from '../../lib/errors.js';
 import { escapeRegex } from '../../lib/util.js';
 import { maskPhone } from '../../lib/logger.js';
 import { roleDef, roleHas } from '../../lib/permissions.js';
-import { can, loadScoped, scope } from '../../middleware/auth.js';
+import { can, loadScoped, scope, scopeMatch } from '../../middleware/auth.js';
 import { audit } from '../../services/audit.js';
 import { requestApproval, registerExecutor } from '../../services/approvals.js';
 import { createRefund, processRefund } from '../../services/refunds.js';
@@ -200,7 +200,7 @@ router.post('/refunds/:id/retry', can('finance.view', 'session.refund'), async (
 // ------------------------------------------------------------- customers
 
 router.get('/customers', can('customer.view'), async (req, res) => {
-  const match = scope(req);
+  const match = scopeMatch(req);
   const rows = await Session.aggregate([
     { $match: { ...match, state: { $in: ['BILLED', 'CHARGING', 'FAILED'] } } },
     { $group: { _id: { driver: '$driver', phone: '$guestPhone' }, sessions: { $sum: 1 }, energyWh: { $sum: '$energyWh' }, spentPaise: { $sum: '$costs.totalPaise' }, last: { $max: '$createdAt' } } },

@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
 import { User, Tenant } from '../models/index.js';
@@ -97,6 +98,12 @@ export function scope(req, { siteField = 'site', tenantField = 'tenant' } = {}) 
   const f = { [tenantField]: req.ctx.tenant };
   if (roleDef(req.ctx.role)?.scope === 'site' && siteField) f[siteField] = { $in: req.ctx.siteIds };
   return f;
+}
+
+/** scope() for aggregate pipelines: $match does not cast string ids to ObjectId like find() does. */
+export function scopeMatch(req, opts) {
+  const oid = (v) => (mongoose.isValidObjectId(v) ? new mongoose.Types.ObjectId(String(v)) : v);
+  return Object.fromEntries(Object.entries(scope(req, opts)).map(([k, v]) => [k, v?.$in ? { $in: v.$in.map(oid) } : oid(v)]));
 }
 
 /** Load a document by id and enforce tenant isolation: another tenant's id gives 403 and a security event (SEC-01). */
