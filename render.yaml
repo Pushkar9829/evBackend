@@ -1,0 +1,53 @@
+# Render Blueprint for the ChargeX backend (API + OCPP WebSocket gateway + OCPI/UEI roaming).
+# Render: New + > Blueprint > pick this repo (evBackend). The frontend deploys separately on Vercel (evFrontEnd).
+services:
+  - type: web
+    name: chargex-api
+    runtime: node
+    plan: starter # WebSockets need an always-on instance; free instances sleep and drop charger connections
+    region: singapore # closest Render region to India
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false # MongoDB Atlas connection string (Render cannot reach your local MongoDB)
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false # e.g. https://chargex.vercel.app,https://*.vercel.app
+      - key: PUBLIC_WEB_URL
+        sync: false # the Vercel URL, used in QR codes and SMS links
+      - key: PUBLIC_API_URL
+        sync: false # this service's URL, e.g. https://chargex-api.onrender.com
+      - key: DEMO_OTP_CODE
+        sync: false # set 123456 for a demo; leave empty once a real SMS provider is configured
+      - key: PAYMENT_PROVIDER
+        value: mock
+      - key: PAYMENT_WEBHOOK_SECRET
+        generateValue: true
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: SMS_PROVIDER
+        value: mock
+      - key: OCPI_PARTY_ID
+        value: CHX
+      - key: GST_RATE_BPS
+        value: "1800"
+      - key: JOBS_ENABLED
+        value: "true"
+      - key: REDIS_URL
+        sync: false # optional: Render Key Value (Redis) URL — required before scaling to 2+ instances
+      - key: MSG91_AUTH_KEY
+        sync: false
+      - key: FCM_SERVICE_ACCOUNT
+        sync: false
+      - key: SMTP_URL
+        sync: false
+      - key: ROUTING_URL
+        sync: false
